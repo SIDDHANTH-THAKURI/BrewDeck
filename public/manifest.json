@@ -1,0 +1,17 @@
+{
+  "name": "BREWDECK — Claude espresso console",
+  "short_name": "BREWDECK",
+  "description": "Voice-brew Claude Code prompts from your phone",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f6efe3",
+  "theme_color": "#f6efe3",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='110' fill='%23f6efe3'/%3E%3Ctext x='256' y='340' font-size='280' text-anchor='middle'%3E%E2%98%95%3C/text%3E%3C/svg%3E",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "brewdeck",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Espresso-bar voice console for Claude Code — brew prompts from your phone",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node scripts/test.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "qrcode-terminal": "^0.12.0",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  }
+}

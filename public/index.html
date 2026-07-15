@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <title>BREWDECK ☕</title>
+  <meta name="description" content="Espresso-bar voice console for Claude Code" />
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#f6efe3" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='85'>☕</text></svg>" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ============ LOCK SCREEN ============ -->
+  <section id="lock">
+    <div class="lock-cup">☕</div>
+    <h1 class="lock-title">BREWDECK</h1>
+    <p class="lock-sub">the barista is asleep — enter PIN</p>
+    <div class="pin-dots" id="pin-dots"><i></i><i></i><i></i><i></i></div>
+    <div class="pad" id="pad"></div>
+    <p class="lock-hint">PIN is printed in the terminal running the server</p>
+  </section>
+
+  <!-- ============ APP ============ -->
+  <main id="app" hidden>
+    <header id="top">
+      <div class="brand">☕ <b>BREW</b>DECK <span id="conn-dot" title="connection"></span></div>
+      <button id="ws-chip" class="chip" title="workspace">📁 <span id="ws-name">…</span></button>
+      <button id="tab-btn" class="chip chip-accent">🧾 TAB</button>
+    </header>
+
+    <!-- machine -->
+    <section id="machine">
+      <p class="mlabel">BEANS <span id="bean-note"></span></p>
+      <div id="beans"></div>
+
+      <div id="gauge-row">
+        <div id="gauge-wrap">
+          <p class="mlabel center">PRESSURE</p>
+          <svg id="gauge" viewBox="0 0 200 120">
+            <path d="M 20 105 A 85 85 0 0 1 180 105" fill="none" stroke="var(--line)" stroke-width="10" stroke-linecap="round"/>
+            <path id="gauge-fill" d="M 20 105 A 85 85 0 0 1 180 105" fill="none" stroke="var(--amber)" stroke-width="10" stroke-linecap="round"/>
+            <g id="gauge-ticks"></g>
+            <g id="needle-g">
+              <line id="needle" x1="100" y1="105" x2="100" y2="34" stroke="var(--espresso)" stroke-width="5" stroke-linecap="round"/>
+              <circle cx="100" cy="105" r="9" fill="var(--espresso)"/>
+              <circle cx="100" cy="105" r="3.5" fill="var(--amber)"/>
+            </g>
+          </svg>
+          <div id="effort-name">DOPPIO</div>
+          <div id="effort-note">standard double</div>
+        </div>
+        <div id="side-opts">
+          <button id="cup-toggle" class="opt on"><span class="opt-ico">🥤</span><span class="opt-t">SAME CUP<em>keeps context</em></span></button>
+          <button id="budget-chip" class="opt"><span class="opt-ico">💰</span><span class="opt-t">CAP $<b id="budget-val">2</b><em>per brew</em></span></button>
+          <button id="lang-chip" class="opt"><span class="opt-ico">🗣️</span><span class="opt-t"><b id="lang-val">EN</b><em>voice language</em></span></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- chat -->
+    <section id="chat"><div id="chat-inner">
+      <div class="hello-card">
+        <b>Counter's open.</b> Pick beans, set the pressure, then
+        <b>hold the lever and speak your order</b> — release to brew.
+        The barista (Claude Code) works inside the selected folder.
+      </div>
+    </div></section>
+
+    <!-- deck -->
+    <footer id="deck">
+      <div id="ticket" hidden><span id="ticket-text"></span></div>
+      <button id="kbd-btn" title="type instead">⌨️</button>
+      <div id="type-wrap" hidden>
+        <textarea id="type-input" rows="1" placeholder="write the order on the cup…"></textarea>
+        <button id="type-send">➤</button>
+      </div>
+      <button id="lever">
+        <span id="lever-ring"></span>
+        <span id="lever-ico">🎙️</span>
+        <span id="lever-label">HOLD · SPEAK · RELEASE</span>
+      </button>
+      <button id="spill" hidden>🛑 SPILL</button>
+    </footer>
+  </main>
+
+  <!-- ============ SHEETS ============ -->
+  <div id="sheet-veil" hidden></div>
+
+  <section id="tab-sheet" class="sheet" hidden>
+    <div class="sheet-grip"></div>
+    <h2>🧾 THE TAB <button id="tab-refresh" class="mini">↻</button></h2>
+    <div id="tab-body"><p class="dim">pouring the numbers…</p></div>
+  </section>
+
+  <section id="ws-sheet" class="sheet" hidden>
+    <div class="sheet-grip"></div>
+    <h2>📁 WORKBENCH FOLDER</h2>
+    <p class="dim small">the barista may read &amp; change anything inside the chosen folder</p>
+    <div id="ws-list"></div>
+  </section>
+
+  <div id="toast" hidden></div>
+  <div id="fx-layer" aria-hidden="true"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

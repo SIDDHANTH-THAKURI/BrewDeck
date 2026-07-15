@@ -1,0 +1,13 @@
+node_modules/
+
+# secrets — PIN + token secret; never commit
+brewdeck.config.json
+
+# self-signed TLS private key + cert
+.cert/
+
+# runtime logs
+*.log
+
+# test artifacts
+qa-shots/
