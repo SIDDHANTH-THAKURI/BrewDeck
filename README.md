@@ -6,10 +6,20 @@ inside the folder you picked — while you watch the receipt print live.
 
 No boring dropdowns:
 
-- **Beans = model.** Haiku is the Light Roast, Sonnet the House Blend, Opus the
-  Dark Roast, Fable the Reserve Ristretto.
-- **Pressure gauge = effort.** Five pulls: SINGLE → DOPPIO → TRIPLE → QUAD →
-  ☠️ DEATH WISH (`--effort low…max`).
+- **Beans = model, and every bean is a bar spirit.** Haiku is **WISP** the
+  steam sprite (Light Roast), Sonnet is **CREMA** the house barista (House
+  Blend), Opus is **BURR** the grinder golem (Dark Roast), Fable is **QUILL**
+  the ink crane (Reserve Ristretto). Switching beans plays a full activation:
+  the current spirit collapses to a point of light, a whiteout flash, and the
+  new one resolves on the stage with its own sound motif and haptics.
+- **Grind dial = effort, and each click-stop is a transformation.** Twist the
+  burr knob from coarse chunks to ☠ powder — finer grind, harder extraction,
+  exactly like a real barista tunes a shot. Five detents:
+  SINGLE → DOPPIO → TRIPLE → QUAD → ☠️ DEATH WISH (`--effort low…max`). Tier
+  up = charge, shockwave, hard palette snap, particle burst, screen-shake
+  (DEATH WISH adds a sub-boom). Tier down = a softer power-down deflation.
+  All real-time canvas simulation — bench-test everything at `/fx-lab.html`;
+  🔊 button on the stage mutes the FX sound.
 - **The lever = your voice.** Hold, speak, release to brew. (Keyboard icon for
   typing instead.)
 - **🧾 THE TAB = usage.** Today's spend, 7-day bars, and a by-bean breakdown of
@@ -38,6 +48,41 @@ Double-click **`start.cmd`** (or `npm start`). The terminal prints:
 Voice works best in Chrome on Android. The 🗣️ chip flips voice recognition
 between English and हिन्दी. On iPhone, use the keyboard (Safari's speech
 support is patchy).
+
+## Leaving mid-brew (lock the phone, close the app, walk away)
+
+The brew runs **on the PC**, never on the phone — the phone is just a window
+onto it. Specifically:
+
+- Lock the phone, close the app, lose signal, switch Wi-Fi → cellular:
+  the brew keeps running. Reopen the app whenever — it reconnects and
+  **replays the whole receipt** (still-brewing or finished).
+- Every brew is also **saved to disk** (`.brews/`, last 25). Even if the PC
+  rebooted or you restarted `start.cmd` since, reopening the app still shows
+  the last receipt. A brew that was mid-pour when the bar died is marked
+  **interrupted** — any files Claude already wrote are still in the folder.
+- The app pings the bar every 20s and reconnects the moment it comes back to
+  the foreground, so a dead connection never masquerades as a live one; the
+  green dot in the header is the truth.
+
+## Push notifications (know when it's served, app closed)
+
+The **PC** sends the notification when a brew ends, so it arrives even with
+the app closed and the phone in your pocket. Needs a *trusted* HTTPS URL
+(browsers refuse service workers on self-signed certs):
+
+1. One-time: enable **HTTPS certificates** for your tailnet —
+   <https://login.tailscale.com/admin/dns> → "Enable HTTPS".
+2. Restart brewdeck. The terminal now prints a
+   **`Trusted: https://<machine>.<tailnet>.ts.net:8443`** URL (real
+   Let's Encrypt cert, auto-renewed) — open the app from *that* URL,
+   no cert warning.
+3. Tap **🔔** in the top bar, allow notifications. Done — "☕ order served"
+   pops up wherever you are.
+
+No-Tailscale fallback: install the [ntfy](https://ntfy.sh) app, pick a long
+random topic name, subscribe to it in the app, and add
+`"ntfyTopic": "your-topic"` to `brewdeck.config.json`.
 
 ## Taking control from anywhere (not just home Wi-Fi)
 
@@ -93,7 +138,15 @@ on your Desktop — pick `brewdeck` itself, the game project, anything).
 
 ## Files
 
-- `server.js` — HTTPS + WebSocket server, Claude job runner, usage ledger
-- `public/` — the phone UI
-- `scripts/test.mjs` — end-to-end test (`npm test`, server must be running)
-- `brewdeck.config.json` — PIN / port / default folder
+- `server.js` — HTTPS + WebSocket server, Claude job runner, brew store, push, usage ledger
+- `public/` — the phone UI (+ `sw.js` service worker: push + offline shell)
+- `public/fx.js` — the roster: character rigs, particle/aura simulation,
+  transition choreography, WebAudio synth + haptics
+- `public/fx-lab.html` — FX test bench (all characters/tiers/transitions,
+  timing + particle + shake sliders, fps meter)
+- `.brews/` — persisted brew receipts (last 25) + push subscriptions
+- `scripts/test-lifecycle.mjs` — `npm test`: boots an isolated bar with a fake
+  `claude`, then force-closes clients mid-brew, restarts the server, etc.
+- `scripts/test.mjs` — `npm run test:live`: full E2E against the real bar +
+  real Claude (server must be running; costs a few cents)
+- `brewdeck.config.json` — PIN / port / default folder / push keys

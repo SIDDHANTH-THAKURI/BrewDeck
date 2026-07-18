@@ -55,191 +55,6 @@ function sfx(kind) {
 }
 const buzz = (ms) => navigator.vibrate && navigator.vibrate(ms);
 
-// ---------------------------------------------------------------- energy charge fx
-// Shared "power-up" feedback for the pressure gauge and the bean picker:
-// a glow ring + spark burst (level scales size/count/duration) plus a
-// rising charge sound that gets longer, higher-pitched and crackles more
-// the further you push it. `level` is 0..1.
-
-const fxLayer = $("fx-layer");
-
-function energyBurst(x, y, level, color) {
-  level = Math.max(0, Math.min(1, level));
-  const ringSize = 44 + level * 90;
-  const ringDur = 260 + level * 340;
-
-  const ring = document.createElement("div");
-  ring.className = "fx-ring";
-  ring.style.left = x + "px";
-  ring.style.top = y + "px";
-  ring.style.width = ringSize + "px";
-  ring.style.height = ringSize + "px";
-  ring.style.background = `radial-gradient(circle, ${color}66 0%, ${color}33 45%, transparent 72%)`;
-  fxLayer.appendChild(ring);
-  const ringAnim = ring.animate(
-    [
-      { transform: "translate(-50%,-50%) scale(0.15)", opacity: 0.95 },
-      { transform: `translate(-50%,-50%) scale(${1 + level * 1.3})`, opacity: 0 },
-    ],
-    { duration: ringDur, easing: "cubic-bezier(.16,.8,.3,1)" }
-  );
-  ringAnim.onfinish = () => ring.remove();
-
-  // second delayed shockwave for the epic tier, timed to land with the
-  // sound's low boom tail — the visual "thump" to match
-  if (level > 0.8) {
-    const boomDelay = (0.1 + level * 0.5) * 1000;
-    const boom = document.createElement("div");
-    boom.className = "fx-ring";
-    boom.style.left = x + "px";
-    boom.style.top = y + "px";
-    boom.style.width = ringSize * 1.6 + "px";
-    boom.style.height = ringSize * 1.6 + "px";
-    boom.style.background = `radial-gradient(circle, ${color}80 0%, ${color}30 50%, transparent 75%)`;
-    fxLayer.appendChild(boom);
-    const boomAnim = boom.animate(
-      [
-        { transform: "translate(-50%,-50%) scale(0.3)", opacity: 0.9 },
-        { transform: "translate(-50%,-50%) scale(1.9)", opacity: 0 },
-      ],
-      { duration: 420, delay: boomDelay, easing: "cubic-bezier(.1,.7,.25,1)" }
-    );
-    boomAnim.onfinish = () => boom.remove();
-  }
-
-  const sparkCount = Math.round(4 + level * 11);
-  for (let i = 0; i < sparkCount; i++) {
-    const s = document.createElement("div");
-    s.className = "fx-spark";
-    s.style.left = x + "px";
-    s.style.top = y + "px";
-    s.style.background = color;
-    s.style.boxShadow = `0 0 ${4 + level * 5}px ${color}`;
-    fxLayer.appendChild(s);
-    const ang = Math.random() * Math.PI * 2;
-    const dist = 16 + level * 52 + Math.random() * 22;
-    const sdur = 340 + level * 300 + Math.random() * 140;
-    const anim = s.animate(
-      [
-        { transform: "translate(-50%,-50%) scale(1)", opacity: 1 },
-        { transform: `translate(${Math.cos(ang) * dist - 3.5}px, ${Math.sin(ang) * dist - 3.5}px) scale(0.15)`, opacity: 0 },
-      ],
-      { duration: sdur, easing: "cubic-bezier(.13,.7,.25,1)" }
-    );
-    anim.onfinish = () => s.remove();
-  }
-}
-
-// warm=true gives a mellower, rounder timbre (used for beans); false is
-// brighter/harsher (used for the pressure gauge) — same escalation shape.
-// modelTier (0..1) is how far up the bean lineup we are (haiku..fable) —
-// it stacks on top of `level` so the SAME gauge pull sounds higher-pitched,
-// louder and more dramatic the further up the beans you've gone, capping
-// out epic/loud/high-pitched for Fable.
-function chargeSound(level, warm = false, modelTier = 0) {
-  try {
-    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
-    if (actx.state === "suspended") actx.resume();
-    level = Math.max(0, Math.min(1, level));
-    modelTier = Math.max(0, Math.min(1, modelTier));
-    const boosted = Math.min(1, level + modelTier * 0.4); // drives pitch/epic threshold
-    const loud = 1 + modelTier * 0.6; // drives loudness on top of that
-    const epic = boosted > 0.8; // Fable / DEATH WISH territory — go dramatic
-    const t = actx.currentTime;
-    const dur = 0.1 + boosted * (epic ? 0.5 : 0.3);
-
-    const o = actx.createOscillator();
-    o.type = boosted > 0.62 ? "sawtooth" : warm ? "sine" : "triangle";
-    const f0 = (warm ? 150 : 190) * (1 + modelTier * 0.35);
-    const f1 = (warm ? 360 : 470) + boosted * (warm ? (epic ? 760 : 480) : 920) + modelTier * 220;
-    o.frequency.setValueAtTime(f0, t);
-    o.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.8);
-    const g = actx.createGain();
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(Math.min(0.34, (0.05 + boosted * (epic ? 0.13 : 0.09)) * loud), t + dur * 0.32);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    o.connect(g);
-    g.connect(actx.destination);
-    o.start(t);
-    o.stop(t + dur + 0.02);
-
-    // sub-bass swell — gives the epic tier real physical weight
-    if (epic) {
-      const sub = actx.createOscillator();
-      sub.type = "sine";
-      sub.frequency.setValueAtTime(46, t);
-      sub.frequency.exponentialRampToValueAtTime(88, t + dur * 0.9);
-      const subG = actx.createGain();
-      subG.gain.setValueAtTime(0.0001, t);
-      subG.gain.linearRampToValueAtTime(Math.min(0.32, 0.17 * boosted * loud), t + dur * 0.5);
-      subG.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.12);
-      sub.connect(subG);
-      subG.connect(actx.destination);
-      sub.start(t);
-      sub.stop(t + dur + 0.14);
-    }
-
-    const crackleBursts = boosted > 0.22 ? (epic ? 2 : 1) : 0;
-    for (let c = 0; c < crackleBursts; c++) {
-      const bufLen = Math.floor(actx.sampleRate * 0.13);
-      const buf = actx.createBuffer(1, bufLen, actx.sampleRate);
-      const d = buf.getChannelData(0);
-      for (let i = 0; i < bufLen; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / bufLen);
-      const src = actx.createBufferSource();
-      src.buffer = buf;
-      const nf = actx.createBiquadFilter();
-      nf.type = "highpass";
-      nf.frequency.value = 1600 + boosted * 2400;
-      const ng = actx.createGain();
-      const startAt = t + dur * (0.45 + c * 0.24);
-      ng.gain.setValueAtTime(0.0001, startAt);
-      ng.gain.linearRampToValueAtTime(Math.min(0.14, (0.025 + boosted * 0.05) * (epic ? 1.4 : 1) * loud), startAt + dur * 0.18);
-      ng.gain.exponentialRampToValueAtTime(0.0001, startAt + dur * 0.4 + 0.05);
-      src.connect(nf);
-      nf.connect(ng);
-      ng.connect(actx.destination);
-      src.start(startAt);
-    }
-
-    const tick = actx.createOscillator();
-    tick.type = "square";
-    tick.frequency.value = 600 + boosted * 360 + modelTier * 200;
-    const tg = actx.createGain();
-    tg.gain.setValueAtTime(0.0001, t + dur);
-    tg.gain.linearRampToValueAtTime(Math.min(0.26, (0.05 + boosted * (epic ? 0.16 : 0.1)) * loud), t + dur + 0.008);
-    tg.gain.exponentialRampToValueAtTime(0.0001, t + dur + (epic ? 0.16 : 0.1));
-    tick.connect(tg);
-    tg.connect(actx.destination);
-    tick.start(t + dur);
-    tick.stop(t + dur + (epic ? 0.18 : 0.11));
-
-    // low boom tail — the "drama" for the top tier
-    if (epic) {
-      const boom = actx.createOscillator();
-      boom.type = "sine";
-      boom.frequency.setValueAtTime(130, t + dur);
-      boom.frequency.exponentialRampToValueAtTime(38, t + dur + 0.3);
-      const bg = actx.createGain();
-      bg.gain.setValueAtTime(0.0001, t + dur);
-      bg.gain.linearRampToValueAtTime(Math.min(0.36, 0.24 * loud), t + dur + 0.02);
-      bg.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.4);
-      boom.connect(bg);
-      bg.connect(actx.destination);
-      boom.start(t + dur);
-      boom.stop(t + dur + 0.42);
-    }
-  } catch {}
-}
-
-// current bean's position in the lineup, 0 (haiku) .. 1 (fable) — used to
-// scale gauge/bean sounds so later beans sound higher-pitched & louder.
-function beanTier(id) {
-  if (!state.models.length) return 0;
-  const maxDepth = Math.max(1, ...state.models.map((m) => m.depth || 1));
-  const m = state.models.find((x) => x.id === id) || { depth: 1 };
-  return maxDepth > 1 ? ((m.depth || 1) - 1) / (maxDepth - 1) : 0;
-}
-
 // ---------------------------------------------------------------- helpers
 
 function toast(msg, ms = 2400) {
@@ -341,11 +156,132 @@ async function enter() {
   $("lock").hidden = true;
   $("app").hidden = false;
   buildBeans();
-  buildGauge();
+  buildGrinder();
   renderOpts();
   renderWorkspaceChip();
+  initFX();
   connectWS();
+  setupPushChip();
 }
+
+// ---------------------------------------------------------------- character stage
+// The roster (fx.js): each bean is a bar spirit, each pressure tier a form.
+// The stage owns all switch/tier cinematics — VFX, synth SFX and haptics fire
+// from the same timeline so they land together.
+
+let fxStage = null;
+
+function initFX() {
+  if (fxStage || !window.BrewFX) return;
+  fxStage = BrewFX.mount($("fx-stage"), {
+    model: state.model,
+    tier: state.effortIdx,
+    muted: LS.getItem("bd-fxmute") === "1",
+    onSwitch(char, o) {
+      $("stage-name").textContent = char.name;
+      $("stage-roast").textContent = char.roast;
+      if (!o.instant) {
+        const cap = $("stage-cap");
+        cap.classList.remove("pop");
+        void cap.offsetWidth; // restart the flourish
+        cap.classList.add("pop");
+      }
+    },
+  });
+  const c = BrewFX.chars[state.model] || BrewFX.chars.sonnet;
+  $("stage-name").textContent = c.name;
+  $("stage-roast").textContent = c.roast;
+  renderFxMute();
+}
+
+function renderFxMute() {
+  $("fx-mute").textContent = LS.getItem("bd-fxmute") === "1" ? "🔇" : "🔊";
+}
+
+$("fx-mute").addEventListener("click", () => {
+  const m = LS.getItem("bd-fxmute") === "1" ? "0" : "1";
+  LS.setItem("bd-fxmute", m);
+  fxStage?.setMuted(m === "1");
+  renderFxMute();
+});
+
+// mobile autoplay policy: audio can only start from a gesture
+document.addEventListener("pointerdown", () => window.BrewFX?.audio.unlock(), { once: true });
+
+// ---------------------------------------------------------------- push
+// The notification fires from the PC when a brew ends — the phone app being
+// closed is the normal case, not the edge case. Needs a service worker,
+// which Chrome only allows on trusted TLS: the tailscale https://…ts.net URL
+// (see README) or localhost. On the self-signed IP origin registration
+// throws and the bell simply stays hidden.
+
+let swReg = null;
+
+function urlB64ToU8(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function setupPushChip() {
+  const chip = $("bell-chip");
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return;
+  try {
+    swReg = await navigator.serviceWorker.register("sw.js");
+  } catch {
+    return; // self-signed origin — push impossible here, keep the bell hidden
+  }
+  chip.hidden = false;
+  if (Notification.permission === "granted") {
+    // re-assert the subscription; endpoints rot when the browser feels like it
+    subscribePush().catch(() => {});
+  } else {
+    renderBell(false);
+  }
+}
+
+async function subscribePush() {
+  const { key } = await api("/api/push/key");
+  const sub = await swReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToU8(key) });
+  await api("/api/push/subscribe", { method: "POST", body: JSON.stringify(sub) });
+  renderBell(true);
+}
+
+async function unsubscribePush() {
+  const sub = await swReg.pushManager.getSubscription();
+  if (sub) {
+    await api("/api/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => {});
+    await sub.unsubscribe().catch(() => {});
+  }
+  renderBell(false);
+}
+
+function renderBell(on) {
+  const chip = $("bell-chip");
+  chip.classList.toggle("on", !!on);
+  chip.textContent = on ? "🔔" : "🔕";
+  chip.dataset.on = on ? "1" : "";
+}
+
+$("bell-chip").addEventListener("click", async () => {
+  sfx("click");
+  try {
+    if ($("bell-chip").dataset.on) {
+      await unsubscribePush();
+      toast("push off — you'll only see results in the app");
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") {
+      toast("notifications blocked — allow them in site settings", 3600);
+      return;
+    }
+    await subscribePush();
+    toast("🔔 you'll get a ping when the brew is served");
+  } catch (e) {
+    toast("push setup failed: " + (e?.message || e), 3600);
+  }
+});
 
 // ---------------------------------------------------------------- beans
 
@@ -370,20 +306,14 @@ function buildBeans() {
     b.innerHTML = `${bagSVG(m.id)}<span class="bag-name">${m.name}</span><span class="bag-roast">${m.roast}</span>`;
     b.addEventListener("click", () => {
       const changed = state.model !== m.id;
-      // capture position before buildBeans() replaces this button's DOM node
-      const rect = b.getBoundingClientRect();
       state.model = m.id;
       LS.setItem("bd-model", m.id);
       buildBeans();
       wrap.querySelector(".bag.sel")?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
-      if (changed) {
-        const level = beanTier(m.id);
-        energyBurst(rect.left + rect.width / 2, rect.top + rect.height * 0.4, level, BEAN_COLORS[m.id] || "#b98a5e");
-        chargeSound(level, true, level);
-        buzz(Math.round(15 + level * 45));
-      } else {
-        sfx("click");
-      }
+      // the stage runs the whole activation: collapse → whiteout → resolve,
+      // with the character's own stinger + haptics
+      if (changed) fxStage?.setModel(m.id);
+      else sfx("click");
     });
     wrap.appendChild(b);
   }
@@ -391,67 +321,76 @@ function buildBeans() {
   $("bean-note").textContent = sel ? "· " + sel.note : "";
 }
 
-// ---------------------------------------------------------------- gauge
+// ---------------------------------------------------------------- grind dial
+// Effort = how fine you grind. Real barista logic: finer grind, harder
+// extraction. Five click-stop detents (coarse chunks → ☠ powder); the knob
+// twists between them with a springy snap and the roster stage fires the
+// matching transformation.
 
-const GAUGE = { cx: 100, cy: 105, r: 85, arc: Math.PI * 85 };
+const GRIND = { c: 100, r: 78, span: 240 }; // detents every 60°, -120°…+120°
+const GRIND_ARC = (GRIND.span / 360) * Math.PI * 2 * GRIND.r;
 
-function stopAngle(i) {
-  return -90 + i * 45; // degrees, 0 = straight up
+function detAngle(i) {
+  return -120 + i * 60; // degrees, 0 = straight up
 }
 
-function buildGauge() {
-  const g = $("gauge-ticks");
-  g.innerHTML = "";
+function buildGrinder() {
+  const g = $("grind-ticks");
   const roman = ["I", "II", "III", "IV", "V"];
+  let html = "";
   for (let i = 0; i < 5; i++) {
-    const a = (stopAngle(i) * Math.PI) / 180;
-    const sx = GAUGE.cx + Math.sin(a) * 72, sy = GAUGE.cy - Math.cos(a) * 72;
-    const ex = GAUGE.cx + Math.sin(a) * 88, ey = GAUGE.cy - Math.cos(a) * 88;
-    const tx = GAUGE.cx + Math.sin(a) * 62, ty = GAUGE.cy - Math.cos(a) * 62;
-    g.innerHTML += `<line class="tick t${i}" x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}"/>
-      <text x="${tx}" y="${ty + 3}" text-anchor="middle">${roman[i]}</text>`;
+    const a = (detAngle(i) * Math.PI) / 180;
+    const dx = GRIND.c + Math.sin(a) * 91, dy = GRIND.c - Math.cos(a) * 91;
+    const nx = GRIND.c + Math.sin(a) * 64, ny = GRIND.c - Math.cos(a) * 64;
+    // detent markers ARE the grind: big chunk at I shrinking to ☠ powder at V
+    if (i === 4) html += `<text class="det skull" x="${dx}" y="${dy + 4}" text-anchor="middle">☠</text>`;
+    else html += `<circle class="det" cx="${dx}" cy="${dy}" r="${4.6 - i * 1.05}"/>`;
+    html += `<text class="rn" x="${nx}" y="${ny + 3}" text-anchor="middle">${roman[i]}</text>`;
   }
-  const svg = $("gauge");
-  svg.addEventListener("pointerdown", gaugePoint);
-  svg.addEventListener("pointermove", (e) => e.buttons && gaugePoint(e));
-  renderGauge(false);
+  g.innerHTML = html;
+  // grip ridges around the knob rim
+  let grips = "";
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2;
+    grips += `<line x1="${100 + Math.sin(a) * 40}" y1="${100 - Math.cos(a) * 40}" x2="${100 + Math.sin(a) * 47}" y2="${100 - Math.cos(a) * 47}"/>`;
+  }
+  $("knob-grips").innerHTML = grips;
+  const svg = $("grinder");
+  svg.addEventListener("pointerdown", grinderPoint);
+  svg.addEventListener("pointermove", (e) => e.buttons && grinderPoint(e));
+  renderGrinder();
 }
 
-function gaugePoint(e) {
-  const r = $("gauge").getBoundingClientRect();
-  const x = ((e.clientX - r.left) / r.width) * 200;
-  const y = ((e.clientY - r.top) / r.height) * 120;
-  const dx = x - GAUGE.cx, dy = GAUGE.cy - y;
-  let a = (Math.atan2(dx, dy) * 180) / Math.PI;
-  a = Math.max(-90, Math.min(90, a));
-  const idx = Math.round((a + 90) / 45);
+function grinderPoint(e) {
+  const r = $("grinder").getBoundingClientRect();
+  const x = ((e.clientX - r.left) / r.width) * 200 - GRIND.c;
+  const y = ((e.clientY - r.top) / r.height) * 200 - GRIND.c;
+  let a = (Math.atan2(x, -y) * 180) / Math.PI; // 0 = up, clockwise positive
+  a = Math.max(-120, Math.min(120, a));
+  const idx = Math.round((a + 120) / 60);
   if (idx !== state.effortIdx) {
     state.effortIdx = idx;
     LS.setItem("bd-effort-idx", idx);
-    renderGauge(true);
-    const level = idx / 4;
-    const tier = beanTier(state.model); // gauge levels sound higher/louder the further up the beans you are
-    const color = idx >= 4 ? "#d9534f" : idx >= 3 ? "#c97f16" : "#e8a33d";
-    const originX = r.left + r.width * 0.5;
-    const originY = r.top + r.height * (GAUGE.cy / 120);
-    energyBurst(originX, originY, Math.min(1, level + tier * 0.4), color);
-    chargeSound(level, false, tier);
-    buzz(Math.round(15 + Math.min(1, level + tier * 0.4) * 45));
+    renderGrinder();
+    // tier up = charge → shockwave → hard snap; tier down = deflation
+    fxStage?.setTier(idx);
   }
 }
 
-function renderGauge() {
+function renderGrinder() {
   const i = state.effortIdx;
   const e = state.efforts[i] || { name: "?", note: "" };
-  $("needle-g").style.transform = `rotate(${stopAngle(i)}deg)`;
-  const fill = $("gauge-fill");
-  const frac = i / 4;
-  fill.style.strokeDasharray = `${GAUGE.arc * frac} ${GAUGE.arc}`;
-  fill.style.stroke = i >= 4 ? "var(--bad)" : i >= 3 ? "var(--amber-deep)" : "var(--amber)";
+  const hot = i >= 4 ? "var(--bad)" : i >= 3 ? "var(--amber-deep)" : "var(--amber)";
+  $("grinder-knob").style.transform = `rotate(${detAngle(i)}deg)`;
+  $("grind-pointer").style.fill = hot;
+  const fill = $("grind-fill");
+  fill.style.strokeDasharray = `${GRIND_ARC * (i / 4)} ${GRIND_ARC}`;
+  fill.style.stroke = hot;
   $("effort-name").textContent = e.name;
   $("effort-name").style.color = i >= 4 ? "var(--bad)" : "var(--espresso-deep)";
   $("effort-note").textContent = e.note;
-  document.querySelectorAll("#gauge-ticks .tick").forEach((t, ti) => t.classList.toggle("hot", ti <= i));
+  document.querySelectorAll("#grind-ticks .det").forEach((d, di) => d.classList.toggle("hot", di <= i));
+  document.querySelectorAll("#grind-ticks .rn").forEach((t, ti) => t.classList.toggle("hot", ti <= i));
 }
 
 // ---------------------------------------------------------------- options
@@ -589,6 +528,8 @@ async function loadUsage() {
 
 let ws = null;
 let wsRetry = 1000;
+let pingTimer = null;
+let pongDeadline = null;
 
 function connectWS() {
   if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
@@ -596,11 +537,13 @@ function connectWS() {
   ws.onopen = () => {
     $("conn-dot").classList.add("on");
     wsRetry = 1000;
+    startPinging();
   };
   ws.onclose = () => {
     $("conn-dot").classList.remove("on");
+    stopPinging();
     // the brew lives on the PC and keeps running while we're away — don't end
-    // it here; the "hello" on reconnect tells us if it's really gone.
+    // it here; the replay on reconnect tells us what really happened.
     setTimeout(connectWS, wsRetry);
     wsRetry = Math.min(wsRetry * 1.6, 10000);
   };
@@ -615,6 +558,57 @@ function connectWS() {
     handleServer(m);
   };
 }
+
+// Switching networks (wifi→cellular) or a long screen-off kills the TCP under
+// us without a close frame — readyState stays OPEN and onclose never fires,
+// which used to freeze the app forever. Only data proves the link is real:
+// ping every 20s, and if the pong doesn't come back in time, declare the
+// socket a zombie and close it ourselves (which triggers the reconnect path).
+function probe(graceMs) {
+  if (!ws || ws.readyState !== 1) return;
+  try {
+    ws.send('{"type":"ping"}');
+  } catch {
+    return;
+  }
+  if (!pongDeadline) {
+    pongDeadline = setTimeout(() => {
+      pongDeadline = null;
+      try {
+        ws.close();
+      } catch {}
+    }, graceMs);
+  }
+}
+
+function startPinging() {
+  stopPinging();
+  pingTimer = setInterval(() => probe(8000), 20000);
+}
+function stopPinging() {
+  clearInterval(pingTimer);
+  clearTimeout(pongDeadline);
+  pingTimer = null;
+  pongDeadline = null;
+}
+
+// The app coming back to life — screen unlocked, tab foregrounded, restored
+// from bfcache, network back — is exactly when the socket deserves zero
+// trust: reconnect immediately if it's closed, and ping-probe it (short
+// grace) if it claims to be open. Timers were frozen the whole time we were
+// backgrounded, so none of this happens on its own.
+function wake() {
+  if (!state.token || $("app").hidden) return;
+  wsRetry = 1000;
+  if (!ws || ws.readyState === 2 || ws.readyState === 3) connectWS();
+  else if (ws.readyState === 1) probe(4000);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) wake();
+});
+window.addEventListener("pageshow", wake);
+window.addEventListener("online", wake);
+window.addEventListener("focus", wake);
 
 // ---------------------------------------------------------------- chat ui
 
@@ -692,6 +686,9 @@ function trimChat() {
 
 // ---------------------------------------------------------------- brewing
 
+let brewAck = null; // armed when an order is sent; cleared by the server echo
+let pendingOrder = ""; // the order text, kept until the bar confirms receipt
+
 function brew(text) {
   text = (text || "").trim();
   if (!text) return;
@@ -709,6 +706,7 @@ function brew(text) {
   addOrder(text);
   addStatus();
   state.brewing = true;
+  fxStage?.setBrewing(true);
   $("lever").classList.add("brewing");
   $("spill").hidden = false;
   $("lever-label").textContent = "BREWING…";
@@ -724,6 +722,31 @@ function brew(text) {
       resume: state.sameCup ? state.sessions[state.workspace] || null : null,
     })
   );
+  // If the socket was secretly dead (zombie), the send above went nowhere and
+  // no "brewing" echo will come back. Close the socket so the reconnect+replay
+  // path can tell us the truth; the order text is kept for a one-tap resend.
+  pendingOrder = text;
+  clearTimeout(brewAck);
+  brewAck = setTimeout(() => {
+    if (state.brewing && ws?.readyState === 1) {
+      try {
+        ws.close();
+      } catch {}
+    }
+  }, 5000);
+}
+
+// After a reconnect, the replay told us what the bar really knows. If it has
+// no trace of the order we sent, the order never arrived — put it back in the
+// user's hands instead of silently eating it.
+function recoverPendingOrder() {
+  if (!pendingOrder) return;
+  const t = pendingOrder;
+  pendingOrder = "";
+  $("type-wrap").hidden = false;
+  $("type-input").value = t;
+  typeInput.dispatchEvent(new Event("input"));
+  toast("order didn't reach the bar — tap ➤ to resend", 4200);
 }
 
 // True while the server is re-sending a brew's buffered transcript after a
@@ -733,6 +756,10 @@ let replaying = false;
 
 function handleServer(m) {
   switch (m.type) {
+    case "pong":
+      clearTimeout(pongDeadline);
+      pongDeadline = null;
+      break;
     case "hello":
       // we think we're brewing but the bar has no brew (it restarted / the
       // brew was spilled elsewhere) — stop pretending
@@ -748,13 +775,23 @@ function handleServer(m) {
       } else {
         replaying = false;
         if (m.live) toast("☕ still brewing — caught you up");
+        // replay is the bar's full memory — if our just-sent order isn't in
+        // it (didn't clear pendingOrder below), it never arrived
+        recoverPendingOrder();
       }
       break;
     case "brewing":
+      // the bar acknowledging OUR order (live echo, or inside a replay after
+      // a blip) — the order made it, stop holding it for resend
+      if (m.text === pendingOrder) {
+        pendingOrder = "";
+        clearTimeout(brewAck);
+      }
       if (replaying) {
         // rebuild the order bubble + brewing chrome we never saw locally
         addOrder(m.text || "");
         state.brewing = true;
+        fxStage?.setBrewing(true);
         $("lever").classList.add("brewing");
         $("spill").hidden = false;
         $("lever-label").textContent = "BREWING…";
@@ -804,6 +841,7 @@ function handleServer(m) {
       if (!replaying) {
         sfx(m.ok ? "ding" : "err");
         buzz(m.ok ? [30, 40, 30] : 80);
+        fxStage?.react(m.ok); // the spirit takes a bow (or droops)
       }
       scrollDown();
       break;
@@ -820,13 +858,17 @@ function handleServer(m) {
 function brewFinished(code, connectionLost, stopped) {
   if (!state.brewing) return;
   state.brewing = false;
+  fxStage?.setBrewing(false);
+  clearTimeout(brewAck);
   removeStatus();
   $("lever").classList.remove("brewing");
   $("spill").hidden = true;
   $("lever-label").textContent = "HOLD · SPEAK · RELEASE";
   if (stopped) toast("☕ spilled — brew cancelled");
-  else if (connectionLost) toast("connection to the bar dropped", 3000);
-  else if (code !== 0 && !curReceipt) toast("the machine jammed (exit " + code + ")", 3200);
+  else if (connectionLost) {
+    toast("connection to the bar dropped", 3000);
+    recoverPendingOrder();
+  } else if (code !== 0 && !curReceipt) toast("the machine jammed (exit " + code + ")", 3200);
   curReceipt = null;
 }
 

@@ -6,6 +6,7 @@
 import express from "express";
 import { WebSocketServer } from "ws";
 import https from "node:https";
+import tls from "node:tls";
 import { spawn, execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -15,9 +16,13 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import selfsigned from "selfsigned";
 import qrcode from "qrcode-terminal";
+import webpush from "web-push";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(ROOT, "brewdeck.config.json");
+// BREWDECK_CONFIG / BREWDECK_DATA let the test suite boot an isolated server
+// (scratch config, scratch brew store) without touching the real bar.
+const CONFIG_PATH = process.env.BREWDECK_CONFIG || path.join(ROOT, "brewdeck.config.json");
+const DATA_DIR = process.env.BREWDECK_DATA || path.join(ROOT, ".brews");
 const CERT_DIR = path.join(ROOT, ".cert");
 const DESKTOP = path.join(os.homedir(), "OneDrive", "Desktop");
 const CLAUDE_DIR = path.join(os.homedir(), ".claude");
@@ -48,11 +53,16 @@ function loadConfig() {
     cfg.defaultWorkspace = ROOT;
     dirty = true;
   }
+  if (!cfg.vapid?.publicKey) {
+    cfg.vapid = webpush.generateVAPIDKeys();
+    dirty = true;
+  }
   if (dirty) fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
   return cfg;
 }
 
 const config = loadConfig();
+if (process.env.BREWDECK_PORT) config.port = Number(process.env.BREWDECK_PORT);
 const TOKEN = createHash("sha256").update(config.pin + ":" + config.secret).digest("hex").slice(0, 40);
 
 // ---------------------------------------------------------------- tls
@@ -397,6 +407,100 @@ app.get("/api/usage", requireAuth, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------- brew store
+
+// Every brew is written to disk as it streams (debounced), so the receipt
+// survives anything short of deleting the folder: phone gone for hours, bar
+// restarted, laptop rebooted. A reconnecting client replays from the live
+// Brew when there is one, else from the newest record on disk — the client
+// can't tell the difference (same wire format).
+
+const KEEP_BREWS = 25;
+
+const brewFile = (id) => path.join(DATA_DIR, id + ".json");
+
+function newBrewId() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return (
+    d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+    p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + "-" +
+    randomBytes(3).toString("hex")
+  );
+}
+
+function saveBrewRecord(rec) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(brewFile(rec.id), JSON.stringify(rec));
+  } catch (err) {
+    console.error("brew store write failed:", err.message);
+  }
+}
+
+function listBrewIds() {
+  try {
+    return fs
+      .readdirSync(DATA_DIR)
+      .filter((f) => f.endsWith(".json") && f !== "push-subs.json")
+      .map((f) => f.slice(0, -5))
+      .sort(); // ids lead with a timestamp — lexical sort is chronological
+  } catch {
+    return [];
+  }
+}
+
+function loadBrewRecord(id) {
+  try {
+    return JSON.parse(fs.readFileSync(brewFile(id), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function latestBrewRecord() {
+  const ids = listBrewIds();
+  return ids.length ? loadBrewRecord(ids[ids.length - 1]) : null;
+}
+
+function pruneBrews() {
+  const ids = listBrewIds();
+  for (const id of ids.slice(0, Math.max(0, ids.length - KEEP_BREWS))) {
+    try {
+      fs.unlinkSync(brewFile(id));
+    } catch {}
+  }
+}
+
+// The bar died mid-brew (crash, reboot, Ctrl-C). We can't reattach to the
+// dead child's stdout, so close the record honestly — the next client sees
+// what happened and where it stopped instead of a blank slate. Returns the
+// settled records so boot can push-notify about them.
+function settleInterruptedBrews() {
+  const settled = [];
+  for (const id of listBrewIds()) {
+    const rec = loadBrewRecord(id);
+    if (!rec || rec.status !== "running") continue;
+    rec.status = "interrupted";
+    rec.endedAt = Date.now();
+    rec.log.push({
+      type: "stderr",
+      text: "the bar restarted mid-brew — output stops here (files Claude already wrote are still in the folder)",
+    });
+    rec.log.push({ type: "done", code: -1, interrupted: true });
+    saveBrewRecord(rec);
+    settled.push(rec);
+  }
+  return settled;
+}
+
+function replayRecord(ws, rec) {
+  if (ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "replay", start: true, id: rec.id }));
+  for (const o of rec.log) ws.send(JSON.stringify(o));
+  ws.send(JSON.stringify({ type: "replay", start: false, live: false }));
+}
+
 // ---------------------------------------------------------------- brewing (claude jobs)
 
 const VALID_MODELS = new Set(MODELS.map((m) => m.id));
@@ -404,19 +508,22 @@ const VALID_EFFORTS = new Set(EFFORTS.map((e) => e.id));
 
 // The claude child runs on the PC, not in the browser, so a brew has no reason
 // to die when the phone locks / the tab closes / wifi drops. A Brew therefore
-// outlives any single socket: it buffers everything it emits into `log` and a
-// reconnecting client re-attaches and replays it. Only an explicit "spill"
-// (or the process finishing / --max-budget-usd) ends a brew.
+// outlives any single socket: it buffers everything it emits into `log` (and
+// mirrors it to disk) and reconnecting clients re-attach and replay it. Only
+// an explicit "spill" (or the process finishing / --max-budget-usd) ends one.
 let currentBrew = null;
 
 const LOG_TEXT_CAP = 400_000; // chars of streamed text kept for replay
+const FLUSH_MS = 800; // debounce for mirroring the log to disk
 
 class Brew {
   constructor(params, ws) {
-    this.ws = ws; // bound directly; attach() is for RECONNECTS (it replays)
+    this.id = newBrewId();
+    this.watchers = new Set(ws ? [ws] : []); // every open socket sees the stream
     this.dead = false;
     this.log = [];
     this.logText = 0;
+    this._flushTimer = null;
 
     const model = VALID_MODELS.has(params.model) ? params.model : "sonnet";
     const effort = VALID_EFFORTS.has(params.effort) ? params.effort : "medium";
@@ -436,6 +543,20 @@ class Brew {
     if (params.resume && /^[0-9a-f-]{16,}$/i.test(params.resume)) {
       args.push("--resume", params.resume);
     }
+
+    this.rec = {
+      id: this.id,
+      status: "running",
+      startedAt: Date.now(),
+      endedAt: null,
+      model,
+      effort,
+      cwd,
+      budget,
+      text: String(params.text || ""),
+      code: null,
+      log: this.log, // same array the replay uses — one source of truth
+    };
 
     // text rides along so a reconnecting client can rebuild the order bubble
     this.send({ type: "brewing", model, effort, cwd, budget, text: String(params.text || "") });
@@ -465,13 +586,42 @@ class Brew {
         this.send({ type: "stderr", text: errBuf.trim().slice(-1500) });
       }
       this.send({ type: "done", code });
-      this.dead = true;
+      this.settle(code === 0 ? "done" : "error", code);
     });
     this.child.on("error", (err) => {
+      if (this.dead) return;
       this.send({ type: "stderr", text: "failed to start claude: " + err.message });
       this.send({ type: "done", code: -1 });
-      this.dead = true;
+      this.settle("error", -1);
     });
+  }
+
+  // one-way latch: finalize the record, flush it, fire the notification
+  settle(status, code) {
+    if (this.dead) return;
+    this.dead = true;
+    this.rec.status = status;
+    this.rec.code = code;
+    this.rec.endedAt = Date.now();
+    this.flush(true);
+    pruneBrews();
+    notifyBrewEnd(this.rec);
+  }
+
+  // debounced disk mirror — a busy stream shouldn't hammer the SSD, but the
+  // record on disk should never lag reality by more than ~a second
+  flush(now = false) {
+    if (now) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+      saveBrewRecord(this.rec);
+    } else if (!this._flushTimer) {
+      this._flushTimer = setTimeout(() => {
+        this._flushTimer = null;
+        saveBrewRecord(this.rec);
+      }, FLUSH_MS);
+      this._flushTimer.unref?.();
+    }
   }
 
   onLine(line) {
@@ -539,31 +689,33 @@ class Brew {
       }
       this.log.push(obj);
     }
+    this.flush();
     this.wire(obj);
   }
 
   wire(obj) {
-    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(obj));
+    const s = JSON.stringify(obj);
+    for (const ws of this.watchers) if (ws.readyState === 1) ws.send(s);
   }
 
   attach(ws) {
-    this.ws = ws;
+    this.watchers.add(ws);
     if (ws.readyState !== 1) return;
-    ws.send(JSON.stringify({ type: "replay", start: true }));
+    ws.send(JSON.stringify({ type: "replay", start: true, id: this.id }));
     for (const o of this.log) ws.send(JSON.stringify(o));
     ws.send(JSON.stringify({ type: "replay", start: false, live: !this.dead }));
   }
 
   detach(ws) {
-    if (this.ws === ws) this.ws = null; // brew keeps running, just unwatched
+    this.watchers.delete(ws); // brew keeps running, just unwatched
   }
 
   stop() {
     if (this.dead || !this.child?.pid) return;
-    this.dead = true;
     // kill the whole tree on Windows (claude spawns children)
     execFile("taskkill", ["/pid", String(this.child.pid), "/T", "/F"], () => {});
     this.send({ type: "done", code: 130, stopped: true });
+    this.settle("stopped", 130);
   }
 }
 
@@ -594,10 +746,150 @@ function toolHint(block) {
   }
 }
 
+// ---------------------------------------------------------------- push
+// Fired from the PC when a brew ends — the phone app is very likely not even
+// running at that point, which is the whole reason push exists here. Web Push
+// needs a service worker, and Chrome only registers one on trusted TLS (the
+// tailscale cert below, or localhost) — never on the self-signed cert. ntfy
+// is the zero-cert fallback: set "ntfyTopic" in brewdeck.config.json and
+// install the ntfy app on the phone.
+
+const SUBS_PATH = path.join(DATA_DIR, "push-subs.json");
+webpush.setVapidDetails("mailto:brewdeck@localhost.invalid", config.vapid.publicKey, config.vapid.privateKey);
+
+function loadSubs() {
+  try {
+    return JSON.parse(fs.readFileSync(SUBS_PATH, "utf8"));
+  } catch {
+    return [];
+  }
+}
+function saveSubs(subs) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(SUBS_PATH, JSON.stringify(subs, null, 2));
+  } catch {}
+}
+
+app.get("/api/push/key", requireAuth, (req, res) => res.json({ key: config.vapid.publicKey }));
+
+app.post("/api/push/subscribe", requireAuth, (req, res) => {
+  const sub = req.body;
+  if (!sub?.endpoint) return res.status(400).json({ error: "bad subscription" });
+  const subs = loadSubs().filter((s) => s.endpoint !== sub.endpoint);
+  subs.push(sub);
+  saveSubs(subs.slice(-8)); // a household of devices, not a mailing list
+  res.json({ ok: true });
+});
+
+app.post("/api/push/unsubscribe", requireAuth, (req, res) => {
+  saveSubs(loadSubs().filter((s) => s.endpoint !== req.body?.endpoint));
+  res.json({ ok: true });
+});
+
+const NOTIFY_TITLES = {
+  done: "☕ order served",
+  error: "☕ brew burnt",
+  interrupted: "☕ brew interrupted — the bar restarted",
+  // "stopped" is absent on purpose: the user spilled it themselves
+};
+
+async function notifyBrewEnd(rec) {
+  const title = NOTIFY_TITLES[rec.status];
+  if (!title) return;
+  const result = rec.log.find((e) => e.type === "result");
+  const bits = [rec.model.toUpperCase(), rec.effort];
+  if (result?.cost != null) bits.push("$" + result.cost.toFixed(2));
+  if (result?.ms != null) bits.push((result.ms / 1000).toFixed(0) + "s");
+  const body = bits.join(" · ");
+
+  const subs = loadSubs();
+  const gone = [];
+  await Promise.all(
+    subs.map(async (sub) => {
+      try {
+        await webpush.sendNotification(sub, JSON.stringify({ title, body }), { TTL: 3600 });
+      } catch (err) {
+        // 404/410 = subscription expired/revoked; anything else is transient
+        if (err.statusCode === 404 || err.statusCode === 410) gone.push(sub.endpoint);
+      }
+    })
+  );
+  if (gone.length) saveSubs(loadSubs().filter((s) => !gone.includes(s.endpoint)));
+
+  if (config.ntfyTopic) {
+    fetch("https://ntfy.sh/" + encodeURIComponent(config.ntfyTopic), {
+      method: "POST",
+      body,
+      headers: { Title: title, Priority: rec.status === "done" ? "default" : "high", Tags: rec.status === "done" ? "coffee" : "warning" },
+    }).catch(() => {});
+  }
+}
+
 // ---------------------------------------------------------------- boot
 
-const tls = ensureCert();
-const server = https.createServer(tls, app);
+// Trusted TLS via Tailscale, when the tailnet has HTTPS certs enabled: mint
+// (and auto-renew) a real Let's Encrypt cert for this machine's ts.net name
+// and serve it via SNI to clients connecting by that hostname. That's what
+// unlocks service-worker registration → push notifications on the phone, and
+// kills the cert warning. Clients hitting a raw IP still get the self-signed
+// cert exactly as before.
+let tsContext = null;
+let tsHost = null;
+
+function tryTailscaleCert() {
+  execFile("tailscale", ["status", "--json"], { windowsHide: true }, (err, out) => {
+    if (err) return; // no tailscale — self-signed only, same as always
+    let dns = "";
+    try {
+      dns = (JSON.parse(out)?.Self?.DNSName || "").replace(/\.$/, "");
+    } catch {}
+    if (!dns) return;
+    const crt = path.join(CERT_DIR, "ts.crt");
+    const key = path.join(CERT_DIR, "ts.key");
+    const arm = () => {
+      try {
+        tsContext = tls.createSecureContext({ cert: fs.readFileSync(crt), key: fs.readFileSync(key) });
+        tsHost = dns.toLowerCase();
+        console.log(`\n  🔒 Trusted (no cert warning, enables push): https://${dns}:${config.port}\n`);
+      } catch {}
+    };
+    let fresh = false;
+    try {
+      // LE certs last 90 days; re-mint after 60 so there's always slack
+      fresh = Date.now() - fs.statSync(crt).mtimeMs < 60 * 86400_000;
+    } catch {}
+    if (fresh) return arm();
+    execFile(
+      "tailscale",
+      ["cert", "--cert-file", crt, "--key-file", key, dns],
+      { windowsHide: true, timeout: 120_000 },
+      (cErr, _stdout, cStderr) => {
+        if (cErr) {
+          if (/not enabled/i.test(String(cStderr) + String(cErr.message || ""))) {
+            console.log("\n  🔔 Want push notifications + no cert warning? One-time step:");
+            console.log("     enable HTTPS certificates → https://login.tailscale.com/admin/dns");
+            console.log("     then restart brewdeck.\n");
+          }
+          return;
+        }
+        arm();
+      }
+    );
+  });
+}
+
+const tlsPair = ensureCert();
+const server = https.createServer(
+  {
+    ...tlsPair,
+    SNICallback(servername, cb) {
+      // undefined ⇒ fall back to the default (self-signed) context
+      cb(null, tsHost && servername.toLowerCase() === tsHost ? tsContext : undefined);
+    },
+  },
+  app
+);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws, req) => {
@@ -606,11 +898,19 @@ wss.on("connection", (ws, req) => {
     ws.close(4001, "locked");
     return;
   }
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
   // tell the client whether a brew is running before anything else, so a
   // client that thinks it's mid-brew can correct itself if the bar restarted
   ws.send(JSON.stringify({ type: "hello", brewing: !!(currentBrew && !currentBrew.dead) }));
-  // reconnecting into a brew (still running, or finished while away)? catch up
-  if (currentBrew) currentBrew.attach(ws);
+  if (currentBrew) {
+    // reconnecting into a brew (still running, or finished while away)? catch up
+    currentBrew.attach(ws);
+  } else {
+    // bar restarted since the last brew — the receipt still exists on disk
+    const rec = latestBrewRecord();
+    if (rec) replayRecord(ws, rec);
+  }
 
   ws.on("message", (raw) => {
     let msg;
@@ -634,6 +934,28 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => currentBrew?.detach(ws));
 });
 
+// Phones fall off networks without ever closing TCP — a locked phone's socket
+// can look OPEN here for many minutes. Ping every 20s and terminate whatever
+// didn't answer the previous round, so dead watchers get reaped instead of
+// accumulating.
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate(); // fires 'close' → detach
+      continue;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {}
+  }
+}, 20_000).unref();
+
+// brews that were mid-flight when the bar last died: close their records and
+// tell the phone (it was almost certainly away — that's why it didn't know)
+for (const rec of settleInterruptedBrews()) notifyBrewEnd(rec);
+tryTailscaleCert();
+
 server.listen(config.port, "0.0.0.0", () => {
   const lan = lanIPs();
   const tsIPs = tailscaleIPs();
@@ -652,6 +974,11 @@ server.listen(config.port, "0.0.0.0", () => {
 
   console.log("\n  Whichever URL you use, accept the one-time certificate warning");
   console.log("  (self-signed) — voice needs HTTPS.\n");
+
+  const nSubs = loadSubs().length;
+  if (nSubs) console.log(`  Push: ${nSubs} device(s) subscribed 🔔`);
+  else if (config.ntfyTopic) console.log("  Push: via ntfy topic (web push not set up — tap 🔔 in the app)");
+  else console.log("  Push: not set up — open the app on the Trusted URL and tap 🔔");
 
   const qrTarget = tsUrls[0] || lanUrls[0];
   console.log("  QR below opens: " + qrTarget + (tsUrls.length ? " (Anywhere)" : " (Wi-Fi)"));

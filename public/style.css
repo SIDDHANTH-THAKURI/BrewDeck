@@ -84,6 +84,8 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 .chip:active { transform: translateY(1px); box-shadow: none; }
 .chip-accent { background: linear-gradient(140deg, #ffe9c4, #ffd98f); border-color: var(--amber-deep); }
+#bell-chip { max-width: none; padding: 8px 10px; }
+#bell-chip.on { border-color: var(--good); background: #f0faf3; }
 
 /* ================= machine ================= */
 #machine {
@@ -99,7 +101,9 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 #bean-note { font-weight: 600; letter-spacing: 0.02em; text-transform: none; margin-left: 6px; }
 
 #beans {
-  display: flex; gap: 10px; overflow-x: auto; padding: 4px 4px 10px;
+  display: flex; gap: 10px; overflow-x: auto;
+  /* headroom for the selected bag's lift + scale — never clip the pop-out */
+  padding: 13px 4px 12px;
   scroll-snap-type: x mandatory; scrollbar-width: none;
 }
 #beans::-webkit-scrollbar { display: none; }
@@ -122,13 +126,21 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 
 #gauge-row { display: flex; gap: 12px; align-items: stretch; }
-#gauge-wrap { flex: 1.25; text-align: center; position: relative; }
-#gauge { width: 100%; max-width: 240px; touch-action: none; }
-#gauge-ticks text { font-size: 9.5px; font-weight: 800; fill: var(--dim); letter-spacing: 0.04em; }
-#gauge-ticks .tick { stroke: var(--dim); stroke-width: 2.5; stroke-linecap: round; }
-#gauge-ticks .tick.hot { stroke: var(--amber-deep); }
-#needle-g { transition: transform 0.28s cubic-bezier(0.3, 1.4, 0.4, 1); transform-origin: 100px 105px; }
-#effort-name { font-size: 17px; font-weight: 900; letter-spacing: 0.12em; color: var(--espresso-deep); margin-top: -6px; }
+#grind-wrap { flex: 1.25; text-align: center; position: relative; }
+#grinder { width: 100%; max-width: 218px; touch-action: none; filter: drop-shadow(0 4px 8px rgba(76, 53, 39, 0.18)); }
+#grinder-knob {
+  transition: transform 0.5s cubic-bezier(0.22, 1.6, 0.36, 1); /* springy click-stop twist */
+  transform-origin: 100px 100px; transform-box: view-box;
+}
+#knob-grips line { stroke: rgba(255, 247, 234, 0.14); stroke-width: 3.4; stroke-linecap: round; }
+#grind-fill { transition: stroke-dasharray 0.35s ease, stroke 0.2s ease; }
+#grind-ticks .det { fill: var(--dim); opacity: 0.5; transition: fill 0.2s, opacity 0.2s; }
+#grind-ticks .det.hot { fill: var(--amber-deep); opacity: 1; }
+#grind-ticks .skull { font-size: 13px; }
+#grind-ticks .skull.hot { fill: var(--bad); }
+#grind-ticks .rn { font-size: 9.5px; font-weight: 800; fill: var(--dim); letter-spacing: 0.04em; transition: fill 0.2s; }
+#grind-ticks .rn.hot { fill: var(--espresso-deep); }
+#effort-name { font-size: 17px; font-weight: 900; letter-spacing: 0.12em; color: var(--espresso-deep); margin-top: 2px; }
 #effort-note { font-size: 11px; color: var(--dim); font-weight: 600; }
 
 #side-opts { flex: 1; display: flex; flex-direction: column; gap: 8px; justify-content: center; }
@@ -220,27 +232,68 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 #kbd-btn:active { transform: translateY(2px); box-shadow: none; }
 
+/* the lever — a portafilter handle: chrome group-head cup + brass grip */
 #lever {
-  flex: 1; height: 74px; border-radius: 24px; position: relative;
-  background: linear-gradient(150deg, var(--amber), var(--amber-deep));
-  border: 2px solid var(--amber-deep);
-  box-shadow: 0 6px 0 #a3670f, var(--shadow);
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
-  color: #fff; overflow: visible;
-  transition: transform 0.08s ease, box-shadow 0.08s ease;
-  touch-action: none;
+  flex: 1; height: 78px; border-radius: 999px; position: relative;
+  display: flex; align-items: center; gap: 13px; padding: 0 20px 0 10px;
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.38), transparent 46%),
+    linear-gradient(160deg, #f2bc59, var(--amber) 42%, var(--amber-deep) 86%);
+  border: 2px solid #a3670f;
+  box-shadow: 0 7px 0 #8a5a0c, inset 0 2px 0 rgba(255, 255, 255, 0.35), var(--shadow);
+  color: #fff; overflow: visible; touch-action: none;
+  transition: transform 0.08s ease, box-shadow 0.08s ease, filter 0.2s ease;
 }
-#lever:active, #lever.listening { transform: translateY(5px); box-shadow: 0 1px 0 #a3670f; }
-#lever-ico { font-size: 24px; text-shadow: 0 2px 3px rgba(0,0,0,0.2); }
-#lever-label { font-size: 10px; font-weight: 900; letter-spacing: 0.22em; opacity: 0.95; }
-#lever.listening { background: linear-gradient(150deg, #ef6a5a, var(--bad)); border-color: #b03a36; box-shadow: 0 1px 0 #8f2f2c; }
-#lever.brewing { filter: saturate(0.4) brightness(0.96); pointer-events: none; }
+#lever::after {
+  /* faint wood-grain on the handle */
+  content: ""; position: absolute; inset: 0; border-radius: 999px; pointer-events: none;
+  background: repeating-linear-gradient(115deg, rgba(140, 90, 20, 0.07) 0 7px, transparent 7px 15px);
+}
+#lever:active, #lever.listening {
+  transform: translateY(6px);
+  box-shadow: 0 1px 0 #8a5a0c, inset 0 2px 0 rgba(255, 255, 255, 0.22);
+}
+#lever-head {
+  width: 56px; height: 56px; border-radius: 50%; flex: none; z-index: 1;
+  display: grid; place-items: center;
+  background: radial-gradient(circle at 36% 30%, #fff8ec, #e7d6ba 46%, #b99c74 78%, #8a6f4e);
+  border: 2.5px solid rgba(255, 255, 255, 0.55);
+  box-shadow: inset 0 -4px 7px rgba(76, 53, 39, 0.35), 0 2px 5px rgba(76, 53, 39, 0.3);
+}
+#lever-ico { font-size: 23px; filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25)); }
+#lever-body { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; z-index: 1; text-align: left; }
+#lever-title { font-size: 14px; font-weight: 900; letter-spacing: 0.13em; text-shadow: 0 1px 2px rgba(122, 74, 10, 0.5); }
+#lever-label { font-size: 9.5px; font-weight: 800; letter-spacing: 0.2em; opacity: 0.92; }
+#lever-steam { position: absolute; left: 26px; top: -13px; display: flex; gap: 5px; pointer-events: none; }
+#lever-steam i {
+  width: 5px; height: 14px; border-radius: 3px; background: rgba(159, 180, 188, 0.55);
+  animation: leverSteam 2.3s ease-in-out infinite;
+}
+#lever-steam i:nth-child(2) { animation-delay: 0.4s; height: 17px; }
+#lever-steam i:nth-child(3) { animation-delay: 0.8s; }
+@keyframes leverSteam {
+  0%, 100% { transform: translateY(0) scaleY(0.7); opacity: 0; }
+  40% { opacity: 0.8; }
+  70% { transform: translateY(-9px) scaleY(1.15); opacity: 0.25; }
+}
+#lever.listening {
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.25), transparent 46%),
+    linear-gradient(160deg, #f07a68, var(--bad) 55%, #b03a36);
+  border-color: #b03a36;
+}
+#lever.listening #lever-head { background: radial-gradient(circle at 36% 30%, #ffe9e6, #f3b6b0 50%, #c76862); }
+#lever.listening #lever-steam { display: none; }
+#lever.brewing { filter: saturate(0.5) brightness(0.97); pointer-events: none; }
+#lever.brewing #lever-title { display: none; }
+#lever.brewing #lever-label { font-size: 12px; letter-spacing: 0.24em; }
+#lever.brewing #lever-steam i { animation-duration: 1.1s; }
 #lever-ring {
-  position: absolute; inset: -7px; border-radius: 30px; pointer-events: none;
+  position: absolute; inset: -8px; border-radius: 999px; pointer-events: none;
   border: 3px solid transparent;
 }
 #lever.listening #lever-ring { border-color: rgba(217, 83, 79, 0.5); animation: ring 1.1s ease-out infinite; }
-@keyframes ring { 0% { transform: scale(0.97); opacity: 1;} 100% { transform: scale(1.09); opacity: 0;} }
+@keyframes ring { 0% { transform: scale(0.97); opacity: 1;} 100% { transform: scale(1.06); opacity: 0;} }
 
 #spill {
   flex: none; height: 52px; border-radius: 18px; padding: 0 16px;
@@ -340,12 +393,27 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 .ws-item.sel { border-color: var(--amber-deep); background: #fff6e2; }
 .ws-item .ws-path { display: block; font-size: 10px; color: var(--dim); font-weight: 600; word-break: break-all; }
 
-/* ================= energy charge fx ================= */
-#fx-layer { position: fixed; inset: 0; pointer-events: none; z-index: 45; overflow: visible; }
-.fx-ring, .fx-spark { position: absolute; left: 0; top: 0; border-radius: 50%; will-change: transform, opacity; }
-.fx-spark { width: 7px; height: 7px; }
-
-#gauge-wrap.charging #gauge { filter: drop-shadow(0 0 6px var(--charge-glow, transparent)); }
+/* ================= character stage ================= */
+#stage-wrap {
+  position: relative; height: clamp(112px, 22dvh, 168px);
+  margin-bottom: 10px; border: 1.5px solid var(--line); border-radius: 16px;
+  background:
+    radial-gradient(340px 100px at 50% 100%, #fdf3df, transparent),
+    var(--paper);
+  overflow: hidden;
+}
+#fx-stage { position: absolute; inset: 0; width: 100%; height: 100%; }
+#stage-cap { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center; pointer-events: none; }
+#stage-cap #stage-name { font-size: 12px; font-weight: 900; letter-spacing: 0.24em; color: var(--espresso-deep); display: block; }
+#stage-cap #stage-roast { font-size: 8px; font-weight: 800; letter-spacing: 0.3em; color: var(--dim); }
+#stage-cap.pop { animation: capPop 0.55s cubic-bezier(0.2, 1.6, 0.4, 1); }
+@keyframes capPop { from { transform: scale(0.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+#fx-mute {
+  position: absolute; top: 8px; right: 8px; width: 30px; height: 30px;
+  border-radius: 50%; background: var(--panel); border: 1.5px solid var(--line);
+  font-size: 13px; z-index: 2;
+}
+#fx-mute:active { transform: translateY(1px); }
 
 /* toast */
 #toast {
@@ -360,4 +428,6 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 @media (min-width: 700px) {
   #machine { max-width: 640px; margin: 0 auto; width: calc(100% - 24px); }
   #deck { max-width: 660px; margin: 0 auto; width: 100%; }
+  /* four bags always fit here — center them instead of hugging the left */
+  #beans { justify-content: center; }
 }

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BREWDECK FX LAB</title>
+  <style>
+    :root {
+      --bg: #f6efe3; --panel: #fffaf1; --paper: #fffdf6; --ink: #3b2f27; --dim: #8a776a;
+      --line: #e6d9c6; --espresso-deep: #4c3527; --amber: #e8a33d; --amber-deep: #c97f16;
+      --shadow: 0 8px 24px rgba(76, 53, 39, 0.14);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg); color: var(--ink); min-height: 100vh;
+      font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      display: flex; flex-direction: column; align-items: center; padding: 18px 14px 40px; gap: 14px;
+    }
+    h1 { font-size: 18px; font-weight: 900; letter-spacing: 0.16em; color: var(--espresso-deep); }
+    h1 small { color: var(--dim); font-size: 11px; letter-spacing: 0.1em; }
+    #stage-wrap {
+      width: min(680px, 100%); height: 210px; position: relative;
+      background: var(--panel); border: 1.5px solid var(--line); border-radius: 20px;
+      box-shadow: var(--shadow); overflow: hidden;
+    }
+    #stage { position: absolute; inset: 0; }
+    #cap {
+      position: absolute; left: 0; right: 0; bottom: 8px; text-align: center; pointer-events: none;
+      font-weight: 900; letter-spacing: 0.22em; font-size: 13px; color: var(--espresso-deep);
+    }
+    #cap small { display: block; font-size: 9px; color: var(--dim); letter-spacing: 0.28em; }
+    #cap.pop { animation: pop 0.55s cubic-bezier(0.2, 1.6, 0.4, 1); }
+    @keyframes pop { 0% { transform: scale(0.6); opacity: 0; letter-spacing: 0.6em; } 100% { transform: scale(1); opacity: 1; letter-spacing: 0.22em; } }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; width: min(680px, 100%); }
+    button {
+      font: inherit; cursor: pointer; background: var(--paper); color: var(--ink);
+      border: 1.5px solid var(--line); border-radius: 12px; padding: 9px 14px;
+      font-weight: 900; font-size: 12px; letter-spacing: 0.08em; box-shadow: 0 2px 0 var(--line);
+    }
+    button:active { transform: translateY(2px); box-shadow: none; }
+    button.sel { border-color: var(--amber-deep); background: #fff6e2; }
+    .lbl { width: 100%; text-align: center; font-size: 9.5px; font-weight: 900; letter-spacing: 0.24em; color: var(--dim); margin-top: 4px; }
+    .sliders { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; font-size: 10.5px; color: var(--dim); font-weight: 700; }
+    .sliders label { display: flex; flex-direction: column; align-items: center; gap: 3px; letter-spacing: 0.1em; }
+    input[type="range"] { width: 110px; accent-color: var(--amber-deep); }
+    #fps { font-family: Consolas, monospace; font-size: 11px; color: var(--dim); }
+  </style>
+</head>
+<body>
+  <h1>FX LAB <small>· the roster, on the bench</small></h1>
+
+  <div id="stage-wrap">
+    <canvas id="stage"></canvas>
+    <div id="cap"><span id="cap-name">CREMA</span><small id="cap-roast">HOUSE BLEND</small></div>
+  </div>
+
+  <div class="row" id="models">
+    <div class="lbl">BEANS — model switch (collapse → whiteout → resolve)</div>
+    <button data-m="haiku">HAIKU · WISP</button>
+    <button data-m="sonnet" class="sel">SONNET · CREMA</button>
+    <button data-m="opus">OPUS · BURR</button>
+    <button data-m="fable">FABLE · QUILL</button>
+  </div>
+
+  <div class="row" id="tiers">
+    <div class="lbl">GRIND — tier transitions (up powers up, down deflates)</div>
+    <button data-t="0">I</button>
+    <button data-t="1" class="sel">II</button>
+    <button data-t="2">III</button>
+    <button data-t="3">IV</button>
+    <button data-t="4">V ☠</button>
+    <button id="cycle">▶ AUTO TOUR</button>
+  </div>
+
+  <div class="row">
+    <div class="lbl">STATES</div>
+    <button id="brew">☕ BREWING</button>
+    <button id="ok">✓ SERVED</button>
+    <button id="bad">✗ BURNT</button>
+    <button id="mute">🔊 SOUND ON</button>
+  </div>
+
+  <div class="sliders">
+    <label>TIME ×<span id="tv">1.0</span><input id="time" type="range" min="0.5" max="3" step="0.1" value="1" /></label>
+    <label>PARTICLES ×<span id="pv">1.0</span><input id="parts" type="range" min="0" max="2" step="0.1" value="1" /></label>
+    <label>SHAKE ×<span id="sv">1.0</span><input id="shk" type="range" min="0" max="2" step="0.1" value="1" /></label>
+  </div>
+  <div id="fps">— fps</div>
+
+  <script src="fx.js"></script>
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const cap = $("cap");
+
+    const stage = BrewFX.mount($("stage"), {
+      model: "sonnet",
+      tier: 1,
+      onSwitch(char) {
+        $("cap-name").textContent = char.name;
+        $("cap-roast").textContent = char.roast;
+        cap.classList.remove("pop");
+        void cap.offsetWidth; // restart the animation
+        cap.classList.add("pop");
+      },
+    });
+
+    // unlock audio on first gesture (mobile autoplay policy)
+    addEventListener("pointerdown", () => BrewFX.audio.unlock(), { once: true });
+
+    let model = "sonnet";
+    let tier = 1;
+    $("models").addEventListener("click", (e) => {
+      const m = e.target.dataset?.m;
+      if (!m || m === model) return;
+      model = m;
+      stage.setModel(m);
+      document.querySelectorAll("#models button").forEach((b) => b.classList.toggle("sel", b.dataset.m === m));
+    });
+    $("tiers").addEventListener("click", (e) => {
+      const t = e.target.dataset?.t;
+      if (t == null) return;
+      tier = Number(t);
+      stage.setTier(tier);
+      document.querySelectorAll("#tiers button[data-t]").forEach((b) => b.classList.toggle("sel", Number(b.dataset.t) === tier));
+    });
+
+    // scripted tour: climbs every tier, powers down, then swaps beans
+    let tour = null;
+    $("cycle").addEventListener("click", () => {
+      if (tour) {
+        clearInterval(tour);
+        tour = null;
+        $("cycle").textContent = "▶ AUTO TOUR";
+        return;
+      }
+      $("cycle").textContent = "⏸ STOP TOUR";
+      const models = ["haiku", "sonnet", "opus", "fable"];
+      let mi = models.indexOf(model);
+      let step = 0;
+      tour = setInterval(() => {
+        step++;
+        if (step % 7 === 6) {
+          mi = (mi + 1) % 4;
+          model = models[mi];
+          stage.setModel(model);
+          document.querySelectorAll("#models button").forEach((b) => b.classList.toggle("sel", b.dataset.m === model));
+        } else {
+          tier = step % 7 < 5 ? step % 7 : 1; // 0..4 then drop to 1
+          stage.setTier(tier);
+          document.querySelectorAll("#tiers button[data-t]").forEach((b) => b.classList.toggle("sel", Number(b.dataset.t) === tier));
+        }
+      }, 1400);
+    });
+
+    let brewing = false;
+    $("brew").addEventListener("click", () => {
+      brewing = !brewing;
+      stage.setBrewing(brewing);
+      $("brew").classList.toggle("sel", brewing);
+    });
+    $("ok").addEventListener("click", () => stage.react(true));
+    $("bad").addEventListener("click", () => stage.react(false));
+
+    let muted = false;
+    $("mute").addEventListener("click", () => {
+      muted = !muted;
+      stage.setMuted(muted);
+      $("mute").textContent = muted ? "🔇 MUTED" : "🔊 SOUND ON";
+    });
+
+    const tune = () => {
+      const t = Number($("time").value), p = Number($("parts").value), s = Number($("shk").value);
+      $("tv").textContent = t.toFixed(1);
+      $("pv").textContent = p.toFixed(1);
+      $("sv").textContent = s.toFixed(1);
+      stage.tune({ time: t, particles: p, shake: s });
+    };
+    for (const id of ["time", "parts", "shk"]) $(id).addEventListener("input", tune);
+
+    // fps meter
+    let frames = 0, t0 = performance.now();
+    (function meter() {
+      requestAnimationFrame(meter);
+      frames++;
+      const now = performance.now();
+      if (now - t0 > 1000) {
+        $("fps").textContent = frames + " fps";
+        frames = 0;
+        t0 = now;
+      }
+    })();
+  </script>
+</body>
+</html>

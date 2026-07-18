@@ -26,26 +26,47 @@
   <main id="app" hidden>
     <header id="top">
       <div class="brand">☕ <b>BREW</b>DECK <span id="conn-dot" title="connection"></span></div>
+      <button id="bell-chip" class="chip" title="notify when served" hidden>🔕</button>
       <button id="ws-chip" class="chip" title="workspace">📁 <span id="ws-name">…</span></button>
       <button id="tab-btn" class="chip chip-accent">🧾 TAB</button>
     </header>
 
     <!-- machine -->
     <section id="machine">
+      <div id="stage-wrap">
+        <canvas id="fx-stage"></canvas>
+        <div id="stage-cap"><span id="stage-name">…</span><small id="stage-roast"></small></div>
+        <button id="fx-mute" title="fx sound">🔊</button>
+      </div>
       <p class="mlabel">BEANS <span id="bean-note"></span></p>
       <div id="beans"></div>
 
       <div id="gauge-row">
-        <div id="gauge-wrap">
-          <p class="mlabel center">PRESSURE</p>
-          <svg id="gauge" viewBox="0 0 200 120">
-            <path d="M 20 105 A 85 85 0 0 1 180 105" fill="none" stroke="var(--line)" stroke-width="10" stroke-linecap="round"/>
-            <path id="gauge-fill" d="M 20 105 A 85 85 0 0 1 180 105" fill="none" stroke="var(--amber)" stroke-width="10" stroke-linecap="round"/>
-            <g id="gauge-ticks"></g>
-            <g id="needle-g">
-              <line id="needle" x1="100" y1="105" x2="100" y2="34" stroke="var(--espresso)" stroke-width="5" stroke-linecap="round"/>
-              <circle cx="100" cy="105" r="9" fill="var(--espresso)"/>
-              <circle cx="100" cy="105" r="3.5" fill="var(--amber)"/>
+        <div id="grind-wrap">
+          <p class="mlabel center">GRIND · coarse → powder</p>
+          <svg id="grinder" viewBox="0 0 200 200">
+            <defs>
+              <radialGradient id="g-metal" cx="0.38" cy="0.3" r="0.95">
+                <stop offset="0" stop-color="#fdf7ec"/>
+                <stop offset="0.55" stop-color="#e9dcc6"/>
+                <stop offset="1" stop-color="#c6ae8a"/>
+              </radialGradient>
+              <radialGradient id="g-knob" cx="0.4" cy="0.32" r="0.95">
+                <stop offset="0" stop-color="#7a5740"/>
+                <stop offset="0.6" stop-color="#4c3527"/>
+                <stop offset="1" stop-color="#33231a"/>
+              </radialGradient>
+            </defs>
+            <circle cx="100" cy="100" r="96" fill="url(#g-metal)" stroke="var(--line)" stroke-width="2"/>
+            <path id="grind-track" d="M 32.5 139 A 78 78 0 1 1 167.5 139" fill="none" stroke="var(--line)" stroke-width="9" stroke-linecap="round"/>
+            <path id="grind-fill" d="M 32.5 139 A 78 78 0 1 1 167.5 139" fill="none" stroke="var(--amber)" stroke-width="9" stroke-linecap="round"/>
+            <g id="grind-ticks"></g>
+            <g id="grinder-knob">
+              <circle cx="100" cy="100" r="50" fill="url(#g-knob)" stroke="#8a5a0c" stroke-width="2"/>
+              <g id="knob-grips"></g>
+              <path id="grind-pointer" d="M 100 41 L 108 58 L 92 58 Z" fill="var(--amber)"/>
+              <circle cx="100" cy="100" r="15" fill="#6f4e37" stroke="#8a5a0c" stroke-width="1.5"/>
+              <circle cx="95" cy="95" r="4" fill="#ffffff2e"/>
             </g>
           </svg>
           <div id="effort-name">DOPPIO</div>
@@ -62,7 +83,7 @@
     <!-- chat -->
     <section id="chat"><div id="chat-inner">
       <div class="hello-card">
-        <b>Counter's open.</b> Pick beans, set the pressure, then
+        <b>Counter's open.</b> Pick beans, set the grind, then
         <b>hold the lever and speak your order</b> — release to brew.
         The barista (Claude Code) works inside the selected folder.
       </div>
@@ -78,8 +99,12 @@
       </div>
       <button id="lever">
         <span id="lever-ring"></span>
-        <span id="lever-ico">🎙️</span>
-        <span id="lever-label">HOLD · SPEAK · RELEASE</span>
+        <span id="lever-steam"><i></i><i></i><i></i></span>
+        <span id="lever-head"><span id="lever-ico">🎙️</span></span>
+        <span id="lever-body">
+          <b id="lever-title">PULL THE LEVER</b>
+          <span id="lever-label">HOLD · SPEAK · RELEASE</span>
+        </span>
       </button>
       <button id="spill" hidden>🛑 SPILL</button>
     </footer>
@@ -102,8 +127,8 @@
   </section>
 
   <div id="toast" hidden></div>
-  <div id="fx-layer" aria-hidden="true"></div>
 
+  <script src="fx.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -6,6 +6,9 @@ brewdeck.config.json
 # self-signed TLS private key + cert
 .cert/
 
+# persisted brews + push subscriptions
+.brews/
+
 # runtime logs
 *.log
 
