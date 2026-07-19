@@ -471,6 +471,49 @@ function closeSheets() {
 }
 $("sheet-veil").addEventListener("click", closeSheets);
 
+// ---------------------------------------------------------------- log (chat drawer)
+// Full-height view of the chat/receipts, for when #machine's beans+gauge+fx
+// canvas eat the whole viewport on a phone and leave the response squeezed
+// into a sliver. Just hides #machine — #chat is already flex:1, so it
+// expands to fill the freed space; the lever/deck stay put so you can still
+// order from here.
+
+$("log-btn").addEventListener("click", () => {
+  const on = $("app").classList.toggle("chat-full");
+  $("log-btn").classList.toggle("on", on);
+  $("log-btn").textContent = on ? "☕ MACHINE" : "📜 LOG";
+  if (on) scrollDown(true);
+});
+
+// ---------------------------------------------------------------- clear the counter
+// Wipes the visible history AND tells the bar to stop replaying it (the
+// server keeps replaying the last receipt on every reconnect otherwise — a
+// client-only wipe would repaint itself within seconds). Two taps to
+// confirm; refused mid-brew. The 🧹 chip only shows in LOG view, where the
+// history actually lives.
+
+let clearArm = 0;
+$("clear-btn").addEventListener("click", () => {
+  if (state.brewing) {
+    toast("can't clear mid-brew — spill it first");
+    return;
+  }
+  if (!ws || ws.readyState !== 1) {
+    toast("no connection to the bar — retrying…");
+    connectWS();
+    return;
+  }
+  const now = Date.now();
+  if (now - clearArm > 2600) {
+    clearArm = now;
+    sfx("tick");
+    toast("tap 🧹 again to wipe the counter");
+    return;
+  }
+  clearArm = 0;
+  ws.send('{"type":"clear"}');
+});
+
 // ---------------------------------------------------------------- usage tab
 
 $("tab-btn").addEventListener("click", () => {
@@ -619,6 +662,15 @@ let orderNo = Number(LS.getItem("bd-orderno") || 0);
 let statusEl = null;
 let statusTimer = null;
 
+// the greeting card, restored after a counter wipe (replays also blow it
+// away, but a wipe should land you back on a welcoming empty counter)
+const HELLO_CARD = `
+      <div class="hello-card">
+        <b>Counter's open.</b> Pick beans, set the grind, then
+        <b>hold the lever and speak your order</b> — release to brew.
+        The barista (Claude Code) works inside the selected folder.
+      </div>`;
+
 function nearBottom() {
   return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 140;
 }
@@ -626,18 +678,41 @@ function scrollDown(force) {
   if (force || nearBottom()) chat.scrollTop = chat.scrollHeight;
 }
 
-function addOrder(text) {
-  orderNo++;
-  LS.setItem("bd-orderno", String(orderNo));
+// The type box floats OVER the bottom edge of the chat (it's anchored above
+// the deck), so while it's open the last receipt could never scroll clear of
+// it — the tail just sat hidden underneath. Matching bottom padding on the
+// chat gives the scroll that extra room; re-measured on every toggle and as
+// the textarea grows.
+function updateChatInset() {
+  const tw = $("type-wrap");
+  const h = tw.hidden ? 0 : tw.offsetHeight + 14;
+  const pin = nearBottom();
+  chatInner.style.paddingBottom = h ? h + "px" : "";
+  if (pin) scrollDown(true);
+}
+
+// meta (replays): the server's "brewing" message carries the brew's REAL
+// model/effort — always label from that, never from whatever happens to be
+// selected right now (which is how a replayed order got mislabeled before).
+// Replays also must not inflate the persistent order counter.
+function addOrder(text, meta) {
+  const replay = !!meta?.replay;
+  if (!replay) {
+    orderNo++;
+    LS.setItem("bd-orderno", String(orderNo));
+  }
+  const modelId = (meta?.model || state.model).toUpperCase();
+  const effName = meta?.effort
+    ? state.efforts.find((e) => e.id === meta.effort)?.name || meta.effort.toUpperCase()
+    : state.efforts[state.effortIdx]?.name || "";
   const d = document.createElement("div");
   d.className = "order";
-  const meta = document.createElement("div");
-  meta.className = "meta";
-  const eff = state.efforts[state.effortIdx];
-  meta.textContent = `ORDER #${orderNo} · ${state.model.toUpperCase()} · ${eff ? eff.name : ""}`;
+  const metaEl = document.createElement("div");
+  metaEl.className = "meta";
+  metaEl.textContent = `ORDER ${replay ? "" : "#" + orderNo + " "}· ${modelId} · ${effName}`;
   const body = document.createElement("div");
   body.textContent = text;
-  d.append(meta, body);
+  d.append(metaEl, body);
   chatInner.appendChild(d);
   trimChat();
   scrollDown(true);
@@ -745,7 +820,7 @@ function recoverPendingOrder() {
   pendingOrder = "";
   $("type-wrap").hidden = false;
   $("type-input").value = t;
-  typeInput.dispatchEvent(new Event("input"));
+  typeInput.dispatchEvent(new Event("input")); // sizes the box + fixes the chat inset
   toast("order didn't reach the bar — tap ➤ to resend", 4200);
 }
 
@@ -788,8 +863,9 @@ function handleServer(m) {
         clearTimeout(brewAck);
       }
       if (replaying) {
-        // rebuild the order bubble + brewing chrome we never saw locally
-        addOrder(m.text || "");
+        // rebuild the order bubble + brewing chrome we never saw locally,
+        // labeled with the brew's true model/effort from the server
+        addOrder(m.text || "", { model: m.model, effort: m.effort, replay: true });
         state.brewing = true;
         fxStage?.setBrewing(true);
         $("lever").classList.add("brewing");
@@ -852,6 +928,21 @@ function handleServer(m) {
     case "done":
       brewFinished(m.code, false, m.stopped);
       break;
+    case "cleared": {
+      // the bar wiped the counter (this device or another one asked)
+      removeStatus();
+      curReceipt = null;
+      chatInner.innerHTML = HELLO_CARD;
+      orderNo = 0;
+      LS.setItem("bd-orderno", "0");
+      // a wiped counter also means a fresh cup — next brew starts clean
+      delete state.sessions[state.workspace];
+      LS.setItem("bd-sessions", JSON.stringify(state.sessions));
+      sfx("click");
+      buzz(20);
+      toast("🧹 counter wiped — next brew starts a fresh cup");
+      break;
+    }
   }
 }
 
@@ -889,35 +980,13 @@ let recHolding = false; // lever is physically held — outlives one recognition
 let recCommitted = ""; // text carried over from earlier sessions in this same hold
 let recSegs = []; // finalized transcript per result index of the CURRENT session
 
-// Mobile (Android) speech recognition doesn't emit clean incremental
-// segments — each new "final" result tends to be a full restatement of
-// the utterance so far (or an exact repeat), not just the new words. So
-// concatenating every final by index duplicates text ("HI" -> "HI HI HI",
-// or a sentence retyping itself word-by-word with everything before it).
-// Fix: when a new final chunk is a superset (or repeat) of what we already
-// have, replace instead of append; only append when it's genuinely new,
-// disjoint content. This is safe for desktop too, where segments are
-// already disjoint and never match the "startsWith" case.
-function mergeFinal(acc, chunk) {
-  chunk = chunk.trim();
-  if (!chunk) return acc;
-  const accTrim = acc.trim();
-  if (!accTrim) return chunk;
-  const a = accTrim.toLowerCase(), c = chunk.toLowerCase();
-  if (c.length >= a.length && c.startsWith(a)) return chunk; // fuller restatement
-  if (a.length >= c.length && a.startsWith(c)) return accTrim; // stale repeat, keep what we have
-  return accTrim + " " + chunk; // genuinely new content
-}
-
 // `e.results` is cumulative — every onresult event re-delivers all earlier
-// results. So finals must be stored BY INDEX and the transcript rebuilt from
-// scratch each event; folding each event's results into a running accumulator
-// re-appends every already-seen final (only index 0 is caught by mergeFinal's
-// prefix guard), which is what made long sentences echo themselves into an
-// oversized prompt. Index-keyed writes are idempotent under re-delivery.
-function joinSegs(segs) {
-  return segs.reduce((acc, s) => mergeFinal(acc, s || ""), "");
-}
+// results, so finals are stored BY INDEX (idempotent under re-delivery) and
+// the transcript is rebuilt from scratch each event. The actual merging —
+// Android's restatement storms, overlap stitching, stale repeats — lives in
+// voice-merge.js (window.VoiceMerge), where node can unit-test it:
+// scripts/test-voice.mjs covers every delivery pattern we've hit in the wild.
+const { mergeFinal, foldSegs } = window.VoiceMerge;
 
 function startListening() {
   if (state.brewing || recActive) return;
@@ -955,7 +1024,7 @@ function openSession() {
       if (r.isFinal) recSegs[i] = r[0].transcript;
       else interim += r[0].transcript;
     }
-    recFinal = mergeFinal(recCommitted, joinSegs(recSegs));
+    recFinal = mergeFinal(recCommitted, foldSegs(recSegs));
     const txt = (recFinal + " " + interim).trim();
     $("ticket-text").textContent = txt || "…";
     $("ticket").hidden = !txt;
@@ -980,7 +1049,7 @@ function openSession() {
 
   rec.onend = () => {
     recActive = false;
-    recCommitted = mergeFinal(recCommitted, joinSegs(recSegs));
+    recCommitted = mergeFinal(recCommitted, foldSegs(recSegs));
     recFinal = recCommitted;
     // Still held? Android just timed out the session — respawn and keep going
     // instead of silently binning a half-spoken sentence.
@@ -1050,17 +1119,20 @@ lever.addEventListener("contextmenu", (e) => e.preventDefault());
 
 function openTyping() {
   $("type-wrap").hidden = false;
+  updateChatInset();
   $("type-input").focus();
 }
 $("kbd-btn").addEventListener("click", () => {
   const w = $("type-wrap");
   w.hidden = !w.hidden;
+  updateChatInset();
   if (!w.hidden) $("type-input").focus();
 });
 const typeInput = $("type-input");
 typeInput.addEventListener("input", () => {
   typeInput.style.height = "auto";
   typeInput.style.height = Math.min(typeInput.scrollHeight, window.innerHeight * 0.3) + "px";
+  updateChatInset(); // the box just grew/shrank under the chat
 });
 typeInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
@@ -1075,6 +1147,7 @@ function sendTyped() {
   typeInput.value = "";
   typeInput.style.height = "auto";
   $("type-wrap").hidden = true;
+  updateChatInset();
   brew(t);
 }
 

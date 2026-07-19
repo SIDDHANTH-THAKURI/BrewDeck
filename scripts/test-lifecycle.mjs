@@ -118,7 +118,7 @@ function sendBrew(c, text) {
 async function latestRecord() {
   const ids = fs
     .readdirSync(DATA)
-    .filter((f) => f.endsWith(".json") && f !== "push-subs.json")
+    .filter((f) => /^\d{8}-\d{6}-[0-9a-f]{6}\.json$/i.test(f))
     .sort();
   if (!ids.length) return null;
   return JSON.parse(fs.readFileSync(path.join(DATA, ids[ids.length - 1]), "utf8"));
@@ -254,6 +254,40 @@ console.log("boot + login ok");
   const after = JSON.parse(fs.readFileSync(path.join(DATA, "push-subs.json"), "utf8"));
   if (after.length !== 0) fail("S5 subscription not removed");
   console.log("S5 push subscribe/unsubscribe + auth wall: ok");
+}
+
+// --- S6: clear the counter — history stays gone across reconnects & restart
+{
+  const c9 = connect(token);
+  await c9.until(replayEnd, 8000, "replay before clear"); // history exists (order delta)
+  c9.ws.send('{"type":"clear"}');
+  await c9.until((m) => m.type === "cleared", 5000, "cleared ack");
+  c9.ws.close();
+
+  const c10 = connect(token);
+  await c10.until((m) => m.type === "hello", 5000, "hello after clear");
+  await sleep(600); // any replay must NOT arrive
+  if (c10.msgs.some((m) => m.type === "replay")) fail("S6 replay leaked after clear");
+  c10.ws.close();
+
+  killServerHard();
+  await sleep(400);
+  bootServer();
+  await waitListening();
+  const c11 = connect(token);
+  await c11.until((m) => m.type === "hello", 5000, "hello after clear+restart");
+  await sleep(600);
+  if (c11.msgs.some((m) => m.type === "replay")) fail("S6 replay leaked after clear+restart");
+
+  // new brews still work AND replay again afterwards (marker only hides the past)
+  sendBrew(c11, "order epsilon");
+  await c11.until((m) => m.type === "done" && m.code === 0, 15000, "post-clear brew done");
+  c11.ws.close();
+  const c12 = connect(token);
+  await c12.until(replayEnd, 8000, "replay of post-clear brew");
+  if (!c12.msgs.some((m) => m.type === "brewing" && m.text === "order epsilon")) fail("S6 post-clear brew not replayed");
+  c12.ws.close();
+  console.log("S6 clear counter → history hidden across restart, new brews replay: ok");
 }
 
 console.log("\nALL LIFECYCLE TESTS PASS");

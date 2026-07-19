@@ -442,7 +442,7 @@ function listBrewIds() {
   try {
     return fs
       .readdirSync(DATA_DIR)
-      .filter((f) => f.endsWith(".json") && f !== "push-subs.json")
+      .filter((f) => /^\d{8}-\d{6}-[0-9a-f]{6}\.json$/i.test(f)) // brew records only — not push-subs/cleared
       .map((f) => f.slice(0, -5))
       .sort(); // ids lead with a timestamp — lexical sort is chronological
   } catch {
@@ -458,9 +458,27 @@ function loadBrewRecord(id) {
   }
 }
 
+// "clear the counter" hides history from replay without deleting the records
+const CLEARED_PATH = () => path.join(DATA_DIR, "cleared.json");
+function clearedAt() {
+  try {
+    return JSON.parse(fs.readFileSync(CLEARED_PATH(), "utf8")).at || 0;
+  } catch {
+    return 0;
+  }
+}
+function markCleared() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CLEARED_PATH(), JSON.stringify({ at: Date.now() }));
+  } catch {}
+}
+
 function latestBrewRecord() {
   const ids = listBrewIds();
-  return ids.length ? loadBrewRecord(ids[ids.length - 1]) : null;
+  if (!ids.length) return null;
+  const rec = loadBrewRecord(ids[ids.length - 1]);
+  return rec && rec.startedAt > clearedAt() ? rec : null;
 }
 
 function pruneBrews() {
@@ -927,6 +945,15 @@ wss.on("connection", (ws, req) => {
       currentBrew = new Brew(msg, ws);
     } else if (msg.type === "stop") {
       currentBrew?.stop();
+    } else if (msg.type === "clear") {
+      if (currentBrew && !currentBrew.dead) {
+        ws.send(JSON.stringify({ type: "stderr", text: "can't clear mid-brew — spill it first" }));
+        return;
+      }
+      currentBrew = null; // stop live replays of the finished brew
+      markCleared(); // and disk replays, across restarts
+      const note = JSON.stringify({ type: "cleared" });
+      for (const c of wss.clients) if (c.readyState === 1) c.send(note); // every device wipes together
     } else if (msg.type === "ping") {
       ws.send('{"type":"pong"}');
     }

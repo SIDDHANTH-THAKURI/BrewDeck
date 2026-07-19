@@ -2,8 +2,8 @@
 // brew ends, so they land even when the app is closed) + shell caching so
 // the app opens instantly and can rehydrate before the network is back.
 
-const CACHE = "brewdeck-v2";
-const SHELL = ["./", "index.html", "app.js", "fx.js", "style.css", "manifest.json"];
+const CACHE = "brewdeck-v3";
+const SHELL = ["./", "index.html", "app.js", "fx.js", "voice-merge.js", "style.css", "manifest.json"];
 const CUP_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='110' fill='%23f6efe3'/%3E%3Ctext x='256' y='340' font-size='280' text-anchor='middle'%3E%E2%98%95%3C/text%3E%3C/svg%3E";
 
