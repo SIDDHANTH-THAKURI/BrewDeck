@@ -24,7 +24,10 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = process.env.BREWDECK_CONFIG || path.join(ROOT, "brewdeck.config.json");
 const DATA_DIR = process.env.BREWDECK_DATA || path.join(ROOT, ".brews");
 const CERT_DIR = path.join(ROOT, ".cert");
-const DESKTOP = path.join(os.homedir(), "OneDrive", "Desktop");
+// Prefer OneDrive-redirected Desktop if present, else the plain profile Desktop.
+const ONEDRIVE_DESKTOP = path.join(os.homedir(), "OneDrive", "Desktop");
+const PLAIN_DESKTOP = path.join(os.homedir(), "Desktop");
+const DESKTOP = fs.existsSync(ONEDRIVE_DESKTOP) ? ONEDRIVE_DESKTOP : PLAIN_DESKTOP;
 const CLAUDE_DIR = path.join(os.homedir(), ".claude");
 
 // ---------------------------------------------------------------- config

@@ -27,6 +27,59 @@ No boring dropdowns:
 - **SAME CUP** keeps conversation context (session resume) per folder;
   **CAP $** limits spend per brew (`--max-budget-usd`).
 
+## Setup on a new PC (cloning this repo)
+
+Nothing to hand-configure or copy over — every credential is generated
+locally on first boot and lives only in gitignored files that never leave
+your machine:
+
+1. `git clone` this repo, then double-click **`start.cmd`** (or `npm start`
+   from a terminal — needs [Node.js](https://nodejs.org) installed). First
+   run does `npm install` for you.
+2. On boot, the server generates a fresh **PIN**, auth **secret**, **VAPID**
+   push keys, and a self-signed **TLS cert**, and writes them to
+   `brewdeck.config.json` / `.cert/` (both in `.gitignore` — your PIN and
+   keys are never committed, and each clone gets its own).
+3. `defaultWorkspace` defaults to the `brewdeck` folder itself; the phone's
+   folder picker also lists everything on your Desktop (`~/OneDrive/Desktop`
+   if you use OneDrive folder redirection, else `~/Desktop`).
+4. Requires the [`claude` CLI](https://docs.claude.com/en/docs/claude-code)
+   installed and logged in on that PC — brews just shell out to it.
+
+That's it — the sections below (PIN entry, Tailscale, push) are all
+per-machine setup that happens after this, not something you copy from
+another install.
+
+## Sharing BREWDECK with someone else
+
+Just give them the repo (`git clone` or a zip) — there's nothing to hand
+over. No shared PIN, no shared keys, no shared account. Each install
+generates its own credentials on first boot.
+
+**Basic setup (same Wi-Fi as their PC):**
+
+1. Their PC needs [Node.js](https://nodejs.org) and the
+   [`claude` CLI](https://docs.claude.com/en/docs/claude-code) installed,
+   logged into **their own** Claude account.
+2. Clone the repo, double-click `start.cmd` (or `npm start`).
+3. Open the printed phone URL from a phone on the same Wi-Fi, enter the PIN.
+
+**If they want it working from anywhere (not just home Wi-Fi):**
+
+1. Install Tailscale on their PC — <https://tailscale.com/download> — and
+   run `tailscale up` (sign in with any account).
+2. Install the Tailscale app on their phone, sign in with the **same**
+   account as step 1.
+3. Restart `start.cmd` — it now prints an extra
+   **`Anywhere (Tailscale): https://100.x.x.x:8443`** line/QR that works
+   from mobile data or any other network.
+4. Optional, for push notifications when the app is closed: enable
+   **HTTPS certificates** for their tailnet at
+   <https://login.tailscale.com/admin/dns>, then restart once more.
+
+Everything (PIN, keys, certs, Tailscale account) is per-person — nothing
+you set up on your machine affects theirs.
+
 ## Start the bar (on the PC)
 
 Double-click **`start.cmd`** (or `npm start`). The terminal prints:
