@@ -22,7 +22,7 @@ const state = {
   listening: false,
 };
 
-const BUDGETS = [0.5, 1, 2, 5];
+const BUDGETS = [0.5, 1, 2, 5, 20];
 const BEAN_COLORS = { haiku: "#d9c8a8", sonnet: "#b98a5e", opus: "#6b4a32", fable: "#31221b" };
 
 // ---------------------------------------------------------------- tiny audio
@@ -678,6 +678,11 @@ let curReceipt = null; // {el, body, tools, gotText}
 let orderNo = Number(LS.getItem("bd-orderno") || 0);
 let statusEl = null;
 let statusTimer = null;
+// The brew id backing whatever's currently at the bottom of the chat — every
+// order/status/receipt element gets tagged with data-brew-id so a reconnect
+// can dedupe-and-replace just THAT brew instead of nuking the whole
+// transcript (see the "replay" case below).
+let currentBrewId = null;
 
 // the greeting card, restored after a counter wipe (replays also blow it
 // away, but a wipe should land you back on a welcoming empty counter)
@@ -724,6 +729,10 @@ function addOrder(text, meta) {
     : state.efforts[state.effortIdx]?.name || "";
   const d = document.createElement("div");
   d.className = "order";
+  if (meta?.id) {
+    d.dataset.brewId = meta.id;
+    currentBrewId = meta.id;
+  }
   const metaEl = document.createElement("div");
   metaEl.className = "meta";
   metaEl.textContent = `ORDER ${replay ? "" : "#" + orderNo + " "}· ${modelId} · ${effName}`;
@@ -733,12 +742,14 @@ function addOrder(text, meta) {
   chatInner.appendChild(d);
   trimChat();
   scrollDown(true);
+  return d;
 }
 
 function addStatus() {
   removeStatus();
   statusEl = document.createElement("div");
   statusEl.className = "brew-status";
+  if (currentBrewId) statusEl.dataset.brewId = currentBrewId;
   statusEl.innerHTML = `<span class="steam"><i></i><i></i><i></i></span><span id="brew-verb">grinding beans…</span>`;
   chatInner.appendChild(statusEl);
   const verbs = ["grinding beans…", "tamping the puck…", "pulling the shot…", "steaming milk…", "reading the crema…", "still extracting…"];
@@ -760,6 +771,7 @@ function ensureReceipt() {
   if (curReceipt) return curReceipt;
   const el = document.createElement("div");
   el.className = "receipt";
+  if (currentBrewId) el.dataset.brewId = currentBrewId;
   const tools = document.createElement("div");
   tools.className = "r-tools";
   tools.style.display = "none";
@@ -780,6 +792,7 @@ function trimChat() {
 
 let brewAck = null; // armed when an order is sent; cleared by the server echo
 let pendingOrder = ""; // the order text, kept until the bar confirms receipt
+let pendingOrderEl = null; // the order bubble we rendered before the bar assigned it a brew id
 
 function brew(text) {
   text = (text || "").trim();
@@ -795,7 +808,7 @@ function brew(text) {
   }
   sfx("send");
   buzz(25);
-  addOrder(text);
+  pendingOrderEl = addOrder(text);
   addStatus();
   state.brewing = true;
   fxStage?.setBrewing(true);
@@ -860,7 +873,14 @@ function handleServer(m) {
     case "replay":
       if (m.start) {
         replaying = true;
-        chatInner.innerHTML = ""; // the log rebuilds it; avoids double-render
+        // Used to wipe the ENTIRE transcript here and let the log rebuild it
+        // — but the server only ever replays the one brew being caught up
+        // on, so every earlier order/receipt vanished on every reconnect.
+        // Only clear what belongs to THIS brew (so it doesn't duplicate);
+        // everything from earlier brews stays put.
+        if (m.id) {
+          for (const el of chatInner.querySelectorAll(`[data-brew-id="${m.id}"]`)) el.remove();
+        }
         removeStatus();
         curReceipt = null;
         state.brewing = false;
@@ -878,11 +898,16 @@ function handleServer(m) {
       if (m.text === pendingOrder) {
         pendingOrder = "";
         clearTimeout(brewAck);
+        // now that the bar's told us this brew's real id, tag the bubble we
+        // rendered optimistically so a later reconnect can find it again
+        if (pendingOrderEl) pendingOrderEl.dataset.brewId = m.id;
+        pendingOrderEl = null;
       }
+      currentBrewId = m.id || currentBrewId;
       if (replaying) {
         // rebuild the order bubble + brewing chrome we never saw locally,
         // labeled with the brew's true model/effort from the server
-        addOrder(m.text || "", { model: m.model, effort: m.effort, replay: true });
+        addOrder(m.text || "", { model: m.model, effort: m.effort, replay: true, id: m.id });
         state.brewing = true;
         fxStage?.setBrewing(true);
         $("lever").classList.add("brewing");
@@ -950,6 +975,8 @@ function handleServer(m) {
       // the bar wiped the counter (this device or another one asked)
       removeStatus();
       curReceipt = null;
+      currentBrewId = null;
+      pendingOrderEl = null;
       chatInner.innerHTML = HELLO_CARD;
       orderNo = 0;
       LS.setItem("bd-orderno", "0");

@@ -569,7 +569,7 @@ function settleInterruptedBrews() {
       type: "stderr",
       text: "the bar restarted mid-brew — output stops here (files Claude already wrote are still in the folder)",
     });
-    rec.log.push({ type: "done", code: -1, interrupted: true });
+    rec.log.push({ type: "done", id: rec.id, code: -1, interrupted: true });
     saveBrewRecord(rec);
     settled.push(rec);
   }
@@ -640,8 +640,9 @@ class Brew {
       log: this.log, // same array the replay uses — one source of truth
     };
 
-    // text rides along so a reconnecting client can rebuild the order bubble
-    this.send({ type: "brewing", model, effort, cwd, budget, text: String(params.text || "") });
+    // text (and id) ride along so a reconnecting client can rebuild the order
+    // bubble AND tell this brew apart from earlier ones still in its history
+    this.send({ type: "brewing", id: this.id, model, effort, cwd, budget, text: String(params.text || "") });
 
     this.child = spawn("claude", args, {
       cwd,
@@ -667,13 +668,13 @@ class Brew {
       if (code !== 0 && errBuf.trim()) {
         this.send({ type: "stderr", text: errBuf.trim().slice(-1500) });
       }
-      this.send({ type: "done", code });
+      this.send({ type: "done", id: this.id, code });
       this.settle(code === 0 ? "done" : "error", code);
     });
     this.child.on("error", (err) => {
       if (this.dead) return;
       this.send({ type: "stderr", text: "failed to start claude: " + err.message });
-      this.send({ type: "done", code: -1 });
+      this.send({ type: "done", id: this.id, code: -1 });
       this.settle("error", -1);
     });
   }
@@ -796,7 +797,7 @@ class Brew {
     if (this.dead || !this.child?.pid) return;
     // kill the whole tree on Windows (claude spawns children)
     execFile("taskkill", ["/pid", String(this.child.pid), "/T", "/F"], () => {});
-    this.send({ type: "done", code: 130, stopped: true });
+    this.send({ type: "done", id: this.id, code: 130, stopped: true });
     this.settle("stopped", 130);
   }
 }
