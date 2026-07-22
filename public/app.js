@@ -478,12 +478,29 @@ $("sheet-veil").addEventListener("click", closeSheets);
 // expands to fill the freed space; the lever/deck stay put so you can still
 // order from here.
 
-$("log-btn").addEventListener("click", () => {
-  const on = $("app").classList.toggle("chat-full");
+// The button is icon-only now, so swap only the glyph text node — writing
+// textContent would take the unread dot element with it.
+const logDot = $("log-btn").querySelector(".chip-dot");
+const logGlyph = $("log-btn").firstChild;
+function chatOpen() {
+  return $("app").classList.contains("chat-full");
+}
+// a brew wrote to the log while you were looking at the machine — flag it
+function markLogUnread() {
+  if (!chatOpen()) logDot.hidden = false;
+}
+
+function setChatFull(on) {
+  $("app").classList.toggle("chat-full", on);
   $("log-btn").classList.toggle("on", on);
-  $("log-btn").textContent = on ? "☕ MACHINE" : "📜 LOG";
-  if (on) scrollDown(true);
-});
+  logGlyph.nodeValue = on ? "☕" : "📜";
+  if (on) {
+    logDot.hidden = true;
+    scrollDown(true);
+  }
+}
+$("log-btn").addEventListener("click", () => setChatFull(!chatOpen()));
+$("goto-chat").addEventListener("click", () => setChatFull(true));
 
 // ---------------------------------------------------------------- clear the counter
 // Wipes the visible history AND tells the bar to stop replaying it (the
@@ -882,6 +899,7 @@ function handleServer(m) {
       const r = ensureReceipt();
       r.gotText = true;
       r.body.textContent += m.text;
+      markLogUnread();
       scrollDown();
       break;
     }
@@ -1141,6 +1159,47 @@ typeInput.addEventListener("keydown", (e) => {
   }
 });
 $("type-send").addEventListener("click", sendTyped);
+
+// ---------------------------------------------------------------- image attach
+
+const imgBtn = $("img-btn");
+const imgInput = $("img-input");
+const EXT_MIME = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", heic: "image/heic", heif: "image/heif", bmp: "image/bmp", svg: "image/svg+xml" };
+imgBtn.addEventListener("click", () => imgInput.click());
+imgInput.addEventListener("change", async () => {
+  const file = imgInput.files[0];
+  imgInput.value = ""; // allow picking the same file again later
+  if (!file) return;
+  imgBtn.textContent = "⏳";
+  try {
+    // A freshly-captured phone photo sometimes has an empty file.type — guess
+    // from the extension rather than falling back to a generic octet-stream
+    // the server would otherwise have to second-guess.
+    const ext = file.name.includes(".") ? file.name.split(".").pop().toLowerCase() : "";
+    const contentType = file.type || EXT_MIME[ext] || "application/octet-stream";
+    const res = await fetch(`/api/upload?workspace=${encodeURIComponent(state.workspace)}&name=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      headers: { "content-type": contentType, "x-brewdeck-token": state.token },
+      body: file,
+    });
+    if (res.status === 401) return lock();
+    if (!res.ok) {
+      const j = await res.json().catch(() => null);
+      throw new Error(j?.error || `upload failed (${res.status})`);
+    }
+    const { path: attachedPath } = await res.json();
+    const sep = typeInput.value && !typeInput.value.endsWith("\n") ? "\n" : "";
+    typeInput.value += `${sep}[attached image: ${attachedPath}]\n`;
+    typeInput.dispatchEvent(new Event("input"));
+    openTyping();
+    toast("image attached — add instructions and send");
+  } catch (e) {
+    toast("image upload failed: " + e.message, 3200);
+  } finally {
+    imgBtn.textContent = "📷";
+  }
+});
+
 function sendTyped() {
   const t = typeInput.value.trim();
   if (!t) return;

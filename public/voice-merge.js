@@ -39,6 +39,21 @@
     return A.every((w, i) => w === B[i]);
   }
 
+  // Like extendsWords, but tolerant of recognition drift: a restatement after
+  // a session respawn is often the SAME sentence reheard slightly differently
+  // partway through ("add a pause menu to the game" -> "add a pause menu
+  // into the game and save progress") — a single swapped word breaks the
+  // exact prefix check above and used to fall through to raw concatenation,
+  // duplicating the whole sentence. Require most positions to match exactly
+  // so genuinely different short utterances never get misread as a restatement.
+  function fuzzyExtends(shorter, longer) {
+    const A = tok(shorter), B = tok(longer);
+    if (A.length < 3 || A.length > B.length) return false;
+    let mismatches = 0;
+    for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) mismatches++;
+    return mismatches <= Math.max(1, Math.round(A.length * 0.25));
+  }
+
   // stitch "…can see my" + "see my previous…" → "…can see my previous…";
   // needs ≥2 overlapping words so a lone "the"/"a" never causes a false join.
   // Returns null when there is no confident overlap.
@@ -69,6 +84,8 @@
     if (!a) return chunk;
     if (extendsWords(a, chunk)) return chunk; // fuller restatement of everything
     if (extendsWords(chunk, a)) return a; // stale repeat, keep what we have
+    if (fuzzyExtends(a, chunk)) return chunk; // drifted restatement of everything
+    if (fuzzyExtends(chunk, a)) return a; // drifted stale repeat
     return overlapMerge(a, chunk) || a + " " + chunk;
   }
 
@@ -84,9 +101,9 @@
       const last = merged[merged.length - 1];
       if (last === undefined) {
         merged.push(s);
-      } else if (extendsWords(last, s)) {
+      } else if (extendsWords(last, s) || fuzzyExtends(last, s)) {
         merged[merged.length - 1] = s; // restatement grew — replace
-      } else if (extendsWords(s, last)) {
+      } else if (extendsWords(s, last) || fuzzyExtends(s, last)) {
         /* stale shorter repeat — drop */
       } else {
         const om = overlapMerge(last, s);
@@ -97,5 +114,5 @@
     return merged.join(" ");
   }
 
-  return { tok, extendsWords, overlapMerge, mergeFinal, foldSegs };
+  return { tok, extendsWords, fuzzyExtends, overlapMerge, mergeFinal, foldSegs };
 });

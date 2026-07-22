@@ -24,6 +24,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = process.env.BREWDECK_CONFIG || path.join(ROOT, "brewdeck.config.json");
 const DATA_DIR = process.env.BREWDECK_DATA || path.join(ROOT, ".brews");
 const CERT_DIR = path.join(ROOT, ".cert");
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 // Prefer OneDrive-redirected Desktop if present, else the plain profile Desktop.
 const ONEDRIVE_DESKTOP = path.join(os.homedir(), "OneDrive", "Desktop");
 const PLAIN_DESKTOP = path.join(os.homedir(), "Desktop");
@@ -272,6 +273,66 @@ function safeWorkspace(p) {
   }
   return config.defaultWorkspace;
 }
+
+// ---------------------------------------------------------------- image uploads
+
+// Images ride into a brew as a plain file path in the prompt text (Claude
+// reads them off disk itself) — stored in DATA_DIR, not the picked workspace,
+// so they never land inside someone's git repo.
+const MAX_UPLOADS = 200; // prune oldest past this so disk use doesn't creep
+const UPLOAD_LIMIT = "30mb"; // phone camera photos routinely run 10-25MB
+const IMAGE_EXT = new Set(["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "svg"]);
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+function pruneUploads() {
+  let files;
+  try {
+    files = fs.readdirSync(UPLOADS_DIR).map((name) => {
+      const p = path.join(UPLOADS_DIR, name);
+      return { name, p, mtime: fs.statSync(p).mtimeMs };
+    });
+  } catch {
+    return;
+  }
+  if (files.length <= MAX_UPLOADS) return;
+  files.sort((a, b) => a.mtime - b.mtime);
+  for (const f of files.slice(0, files.length - MAX_UPLOADS)) {
+    try {
+      fs.unlinkSync(f.p);
+    } catch {}
+  }
+}
+
+app.post(
+  "/api/upload",
+  requireAuth,
+  express.raw({ type: () => true, limit: UPLOAD_LIMIT }),
+  (req, res) => {
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: "empty upload" });
+    const origName = path.basename(String(req.query.name || "photo")).replace(/[^\w.\-]/g, "_") || "photo";
+    const ext = origName.includes(".") ? origName.split(".").pop().toLowerCase() : "";
+    const ct = String(req.headers["content-type"] || "");
+    // Some mobile browsers hand back an empty/octet-stream type for a
+    // freshly-captured camera photo (the File object's .type isn't always
+    // populated yet) — fall back to the extension so a real photo isn't
+    // rejected just because the browser didn't label it.
+    if (!ct.startsWith("image/") && !IMAGE_EXT.has(ext)) {
+      return res.status(400).json({ error: "only images are accepted" });
+    }
+    const fname = `${Date.now()}-${randomBytes(4).toString("hex")}-${origName}`;
+    const dest = path.join(UPLOADS_DIR, fname);
+    fs.writeFileSync(dest, req.body);
+    pruneUploads();
+    res.json({ path: dest });
+  },
+  // express.raw's own error (e.g. entity.too.large past UPLOAD_LIMIT) would
+  // otherwise fall through to Express's default HTML error page — the client
+  // expects JSON, so give it JSON here instead of a parse-failure toast.
+  (err, req, res, next) => {
+    if (err?.type === "entity.too.large") return res.status(413).json({ error: `image too big (max ${UPLOAD_LIMIT})` });
+    res.status(500).json({ error: "upload failed" });
+  }
+);
 
 // ---------------------------------------------------------------- usage ledger
 

@@ -27,13 +27,14 @@
     <header id="top">
       <div class="brand">☕ <b>BREW</b>DECK <span id="conn-dot" title="connection"></span></div>
       <button id="bell-chip" class="chip" title="notify when served" hidden>🔕</button>
-      <button id="ws-chip" class="chip" title="workspace">📁 <span id="ws-name">…</span></button>
+      <button id="ws-chip" class="chip" title="workspace folder">📁<span id="ws-name"></span></button>
       <button id="clear-btn" class="chip" title="clear the counter">🧹</button>
-      <button id="log-btn" class="chip" title="full chat & receipts">📜 LOG</button>
-      <button id="tab-btn" class="chip chip-accent">🧾 TAB</button>
+      <button id="log-btn" class="chip" title="chat &amp; receipts">📜<i class="chip-dot" hidden></i></button>
+      <button id="tab-btn" class="chip chip-accent" title="the tab — usage">🧾</button>
     </header>
 
     <!-- machine -->
+    <div id="machine-scroll">
     <section id="machine">
       <div id="stage-wrap">
         <canvas id="fx-stage"></canvas>
@@ -75,18 +76,26 @@
           <div id="effort-note">standard double</div>
         </div>
         <div id="side-opts">
-          <button id="cup-toggle" class="opt on"><span class="opt-ico">🥤</span><span class="opt-t">SAME CUP<em>keeps context</em></span></button>
-          <button id="budget-chip" class="opt"><span class="opt-ico">💰</span><span class="opt-t">CAP $<b id="budget-val">2</b><em>per brew</em></span></button>
-          <button id="lang-chip" class="opt"><span class="opt-ico">🗣️</span><span class="opt-t"><b id="lang-val">EN</b><em>voice language</em></span></button>
+          <button id="cup-toggle" class="opt on" title="SAME CUP — keep conversation context">
+            <span class="opt-ico">🥤</span><b class="opt-v">CUP</b>
+          </button>
+          <button id="budget-chip" class="opt" title="spend cap per brew">
+            <span class="opt-ico">💰</span><b class="opt-v">$<span id="budget-val">2</span></b>
+          </button>
+          <button id="lang-chip" class="opt" title="voice language">
+            <span class="opt-ico">🗣️</span><b class="opt-v" id="lang-val">EN</b>
+          </button>
         </div>
       </div>
+      <button id="goto-chat" title="place your order">📜 tap to order</button>
     </section>
+    </div>
 
     <!-- chat -->
     <section id="chat"><div id="chat-inner">
       <div class="hello-card">
         <b>Counter's open.</b> Pick beans, set the grind, then
-        <b>hold the lever and speak your order</b> — release to brew.
+        <b>hold the mic and speak your order</b> — release to brew.
         The barista (Claude Code) works inside the selected folder.
       </div>
     </div></section>
@@ -94,21 +103,21 @@
     <!-- deck -->
     <footer id="deck">
       <div id="ticket" hidden><span id="ticket-text"></span></div>
-      <button id="kbd-btn" title="type instead">⌨️</button>
       <div id="type-wrap" hidden>
+        <button id="img-btn" title="attach image">📷</button>
+        <input id="img-input" type="file" accept="image/*" hidden />
         <textarea id="type-input" rows="1" placeholder="write the order on the cup…"></textarea>
         <button id="type-send">➤</button>
       </div>
-      <button id="lever">
-        <span id="lever-ring"></span>
-        <span id="lever-steam"><i></i><i></i><i></i></span>
-        <span id="lever-head"><span id="lever-ico">🎙️</span></span>
-        <span id="lever-body">
-          <b id="lever-title">PULL THE LEVER</b>
-          <span id="lever-label">HOLD · SPEAK · RELEASE</span>
-        </span>
-      </button>
-      <button id="spill" hidden>🛑 SPILL</button>
+      <div id="deck-row">
+        <button id="kbd-btn" title="type instead">⌨️</button>
+        <button id="lever" title="hold to speak">
+          <span id="lever-ring"></span>
+          <span id="lever-ico">🎙️</span>
+        </button>
+        <button id="spill" hidden title="stop this brew">🛑</button>
+      </div>
+      <div id="lever-label">HOLD · SPEAK · RELEASE</div>
     </footer>
   </main>
 

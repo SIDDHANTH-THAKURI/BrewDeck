@@ -21,7 +21,9 @@ No boring dropdowns:
   All real-time canvas simulation — bench-test everything at `/fx-lab.html`;
   🔊 button on the stage mutes the FX sound.
 - **The lever = your voice.** Hold, speak, release to brew. (Keyboard icon for
-  typing instead.)
+  typing instead.) The typing box also has a **📷** to attach a photo/screenshot
+  from your phone — it uploads to the PC and a file path gets dropped into the
+  order text so Claude can read the image before brewing.
 - **🧾 THE TAB = usage.** Today's spend, 7-day bars, and a by-bean breakdown of
   the last 14 days, parsed from your local Claude Code logs.
 - **SAME CUP** keeps conversation context (session resume) per folder;
