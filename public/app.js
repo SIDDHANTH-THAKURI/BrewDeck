@@ -693,6 +693,36 @@ const HELLO_CARD = `
         The barista (Claude Code) works inside the selected folder.
       </div>`;
 
+// The rendered transcript is snapshotted to localStorage so a real tab close
+// / phone reboot — not just a reconnect — still comes back to a full chat,
+// not just the hello card. Nothing here has event listeners attached (plain
+// divs/spans), so a raw innerHTML round-trip is safe; every order/receipt is
+// already brew-id-tagged, so the WS replay/live flow reconciles the current
+// brew on top of whatever's restored, same as it does after a reconnect.
+const CHAT_LS_KEY = "bd-chatlog";
+function saveChatNow() {
+  try {
+    LS.setItem(CHAT_LS_KEY, chatInner.innerHTML);
+  } catch {
+    /* quota exceeded or storage disabled — chat just won't survive a reload */
+  }
+}
+let saveChatTimer = null;
+function scheduleSaveChat() {
+  clearTimeout(saveChatTimer);
+  saveChatTimer = setTimeout(saveChatNow, 600);
+}
+{
+  const savedChat = LS.getItem(CHAT_LS_KEY);
+  if (savedChat) {
+    chatInner.innerHTML = savedChat;
+    // a mid-brew "grinding beans…" pulse never means anything after a fresh
+    // load (its interval timer is gone) — the WS "hello"/replay tells us if
+    // that brew is still actually running and re-adds it if so
+    chatInner.querySelector(".brew-status")?.remove();
+  }
+}
+
 function nearBottom() {
   return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 140;
 }
@@ -742,6 +772,7 @@ function addOrder(text, meta) {
   chatInner.appendChild(d);
   trimChat();
   scrollDown(true);
+  scheduleSaveChat();
   return d;
 }
 
@@ -890,6 +921,7 @@ function handleServer(m) {
         // replay is the bar's full memory — if our just-sent order isn't in
         // it (didn't clear pendingOrder below), it never arrived
         recoverPendingOrder();
+        scheduleSaveChat();
       }
       break;
     case "brewing":
@@ -926,6 +958,7 @@ function handleServer(m) {
       r.body.textContent += m.text;
       markLogUnread();
       scrollDown();
+      scheduleSaveChat();
       break;
     }
     case "tool": {
@@ -937,6 +970,7 @@ function handleServer(m) {
       r.tools.appendChild(pill);
       if (r.tools.children.length > 14) r.tools.firstChild.remove();
       scrollDown();
+      scheduleSaveChat();
       break;
     }
     case "result": {
@@ -963,6 +997,7 @@ function handleServer(m) {
         fxStage?.react(m.ok); // the spirit takes a bow (or droops)
       }
       scrollDown();
+      scheduleSaveChat();
       break;
     }
     case "stderr":
@@ -978,6 +1013,7 @@ function handleServer(m) {
       currentBrewId = null;
       pendingOrderEl = null;
       chatInner.innerHTML = HELLO_CARD;
+      saveChatNow(); // immediate, not debounced — a reload right after a wipe must not resurrect the old chat
       orderNo = 0;
       LS.setItem("bd-orderno", "0");
       // a wiped counter also means a fresh cup — next brew starts clean
@@ -1179,12 +1215,8 @@ typeInput.addEventListener("input", () => {
   typeInput.style.height = Math.min(typeInput.scrollHeight, window.innerHeight * 0.3) + "px";
   updateChatInset(); // the box just grew/shrank under the chat
 });
-typeInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    sendTyped();
-  }
-});
+// Enter (including a mobile keyboard's "next line"/return key) always just
+// breaks the line — only the ➤ button sends. No auto-submit-on-Enter here.
 $("type-send").addEventListener("click", sendTyped);
 
 // ---------------------------------------------------------------- image attach
