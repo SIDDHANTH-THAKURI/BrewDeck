@@ -2,6 +2,10 @@ node_modules/
 
 # secrets — PIN + token secret; never commit
 brewdeck.config.json
+brewdeck.config.json.bak
+
+# secrets — Twilio / Deepgram / ElevenLabs keys
+.env
 
 # self-signed TLS private key + cert
 .cert/

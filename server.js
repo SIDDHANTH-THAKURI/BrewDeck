@@ -8,7 +8,7 @@ import { WebSocketServer } from "ws";
 import https from "node:https";
 import tls from "node:tls";
 import { spawn, execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import selfsigned from "selfsigned";
 import qrcode from "qrcode-terminal";
 import webpush from "web-push";
+import { mountCall } from "./call.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 // BREWDECK_CONFIG / BREWDECK_DATA let the test suite boot an isolated server
@@ -42,7 +43,10 @@ function loadConfig() {
   }
   let dirty = false;
   if (!cfg.pin) {
-    cfg.pin = String(Math.floor(1000 + Math.random() * 9000));
+    // 8 digits from the CSPRNG, not 4 from Math.random(): with Tailscale Funnel
+    // on, this gate faces the whole internet rather than just the tailnet, and
+    // Math.random() is predictable enough that PIN length alone wouldn't help.
+    cfg.pin = String(randomInt(10_000_000, 100_000_000));
     dirty = true;
   }
   if (!cfg.port) {
@@ -973,7 +977,29 @@ const server = https.createServer(
   },
   app
 );
-const wss = new WebSocketServer({ server, path: "/ws" });
+// Both the browser path (/ws) and the phone path (/twilio/stream) need a
+// WebSocket on this one server, and `ws` can't do that via the `path` option:
+// whichever WebSocketServer is constructed first aborts every non-matching
+// upgrade with a 400 before the second one is consulted. So both run with
+// noServer and this handler routes upgrades by pathname.
+const wss = new WebSocketServer({ noServer: true });
+const callPath = mountCall({ app, config });
+
+server.on("upgrade", (req, socket, head) => {
+  let pathname;
+  try {
+    pathname = new URL(req.url, "https://x").pathname;
+  } catch {
+    return socket.destroy();
+  }
+  if (pathname === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else if (pathname === "/twilio/stream") {
+    callPath.handleUpgrade(req, socket, head);
+  } else {
+    socket.destroy();
+  }
+});
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "https://x");
@@ -1066,6 +1092,12 @@ server.listen(config.port, "0.0.0.0", () => {
 
   console.log("\n  Whichever URL you use, accept the one-time certificate warning");
   console.log("  (self-signed) — voice needs HTTPS.\n");
+
+  if (callPath.ready) {
+    console.log(`  Phone: calls allowed from ${callPath.cfg.allowFrom.join(", ")} 📞`);
+  } else {
+    console.log("  Phone: disabled — set the TWILIO_/DEEPGRAM_/ELEVENLABS_ keys and CALL_ALLOW_FROM in .env");
+  }
 
   const nSubs = loadSubs().length;
   if (nSubs) console.log(`  Push: ${nSubs} device(s) subscribed 🔔`);

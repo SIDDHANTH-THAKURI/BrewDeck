@@ -5,8 +5,8 @@
   "type": "module",
   "description": "Espresso-bar voice console for Claude Code — brew prompts from your phone",
   "scripts": {
-    "start": "node server.js",
-    "test": "node scripts/test-voice.mjs && node scripts/test-lifecycle.mjs",
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node scripts/test-voice.mjs && node scripts/test-call.mjs && node scripts/test-lifecycle.mjs",
     "test:live": "node scripts/test.mjs"
   },
   "dependencies": {
