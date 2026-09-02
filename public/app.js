@@ -90,7 +90,11 @@ function lock() {
   $("lock").hidden = false;
 }
 
+// PIN length isn't fixed (was 4 digits, is 8+ since the config started
+// generating stronger PINs) so the pad can't auto-submit at a hardcoded
+// length — ☕ is the submit key, ⌫ backspaces, up to MAX_PIN digits.
 let pinBuf = "";
+const MAX_PIN = 16;
 function buildPad() {
   const pad = $("pad");
   const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "☕", "0", "⌫"];
@@ -102,15 +106,22 @@ function buildPad() {
       sfx("click");
       buzz(10);
       if (k === "⌫") pinBuf = pinBuf.slice(0, -1);
-      else if (k !== "☕") pinBuf = (pinBuf + k).slice(0, 4);
+      else if (k === "☕") return pinBuf.length ? tryPin() : undefined;
+      else pinBuf = (pinBuf + k).slice(0, MAX_PIN);
       renderPin();
-      if (pinBuf.length === 4) tryPin();
     });
     pad.appendChild(b);
   }
 }
 function renderPin() {
-  [...$("pin-dots").children].forEach((d, i) => d.classList.toggle("fill", i < pinBuf.length));
+  const dots = $("pin-dots");
+  dots.innerHTML = "";
+  const shown = Math.max(pinBuf.length, 4); // never shrinks below the old 4-dot look
+  for (let i = 0; i < shown; i++) {
+    const d = document.createElement("i");
+    if (i < pinBuf.length) d.classList.add("fill");
+    dots.appendChild(d);
+  }
 }
 async function tryPin() {
   try {
@@ -599,9 +610,13 @@ function connectWS() {
     wsRetry = 1000;
     startPinging();
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     $("conn-dot").classList.remove("on");
     stopPinging();
+    // 4001 = the server no longer accepts this token (PIN rotated, config
+    // reset). Retrying forever with the same bad token just hangs silently —
+    // show the lock screen instead so a fresh login actually fixes it.
+    if (ev.code === 4001) return lock();
     // the brew lives on the PC and keeps running while we're away — don't end
     // it here; the replay on reconnect tells us what really happened.
     setTimeout(connectWS, wsRetry);
