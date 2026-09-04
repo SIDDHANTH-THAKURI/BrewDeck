@@ -18,3 +18,6 @@ brewdeck.config.json.bak
 
 # test artifacts
 qa-shots/
+
+# page snapshots the browser MCP server drops while driving a call
+.playwright-mcp/

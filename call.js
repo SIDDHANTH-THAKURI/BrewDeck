@@ -12,20 +12,144 @@
 import { spawn, execFile } from "node:child_process";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import readline from "node:readline";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+
+// A generated (not checked-in) settings file wiring up call-hooks/block-push.mjs
+// as a PreToolUse hook, scoped to the phone-call claude spawn only — the
+// browser brew path in server.js is untouched. Written once at boot so the
+// absolute hook path is always correct for whatever machine this runs on,
+// rather than baking a path (with this user's home directory in it) into git.
+const CALL_SETTINGS_PATH = path.join(ROOT, ".brews", "call-hook-settings.json");
+
+// Browser control for the task tier, so "open YouTube and play the third
+// video" can actually happen rather than being refused.
+//
+// Two deliberate choices here, both security-relevant:
+//  - Paired with --strict-mcp-config, so a call sees ONLY this server. The
+//    account has Gmail, Drive and Calendar MCP servers connected; a phone call
+//    running with permissions bypassed has no business reaching the user's
+//    email or documents, and strict mode keeps them out.
+//  - --isolated gives a throwaway browser profile rather than the real one, so
+//    a call can't act as the signed-in user on their accounts, and it can't
+//    collide with an already-running browser holding that profile open.
+// The channel (msedge/chrome) uses an already-installed browser, so nothing
+// large gets downloaded.
+const CALL_MCP_PATH = path.join(ROOT, ".brews", "call-mcp.json");
+function writeCallMcp(browser) {
+  fs.mkdirSync(path.dirname(CALL_MCP_PATH), { recursive: true });
+  const cfg = {
+    mcpServers: {
+      browser: {
+        command: "npx",
+        args: ["-y", "@playwright/mcp@latest", "--browser", browser, "--isolated", "--viewport-size", "1280,800"],
+      },
+    },
+  };
+  fs.writeFileSync(CALL_MCP_PATH, JSON.stringify(cfg, null, 2));
+}
+
+function writeCallSettings() {
+  fs.mkdirSync(path.dirname(CALL_SETTINGS_PATH), { recursive: true });
+  const settings = {
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [{ type: "command", command: "node", args: [path.join(ROOT, "call-hooks", "block-push.mjs")] }],
+        },
+      ],
+    },
+  };
+  fs.writeFileSync(CALL_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+}
+
+// Chat turns run here rather than in the repo, so claude isn't sitting in
+// brewdeck's working tree seeing uncommitted changes and steering every
+// conversation back to them.
+//
+// This MUST live outside the repo: an earlier version put it under .brews/ and
+// a caller still got told about uncommitted changes in call.js, because
+// CLAUDE.md discovery and git context both walk *up* from the working
+// directory and found the project anyway. Sitting in the OS temp dir there is
+// no parent project to discover, which also cuts the startup work.
+const CALL_SCRATCH_DIR = path.join(os.tmpdir(), "brewdeck-call-scratch");
+
+// Each call is its own claude session — nothing is resumed across calls, so a
+// long history can't pile up and drag the conversation. Continuity instead
+// comes from this small file: a handful of durable facts, read into the prompt
+// at the start of every call and appended to when the call ends.
+const CALL_MEMORY_PATH = path.join(ROOT, ".brews", "call-memory.md");
+const MEMORY_CHAR_CAP = 4000;
+
+export function readCallMemory() {
+  try {
+    const raw = fs.readFileSync(CALL_MEMORY_PATH, "utf8").trim();
+    if (!raw) return "";
+    // keep the most recent entries if it has grown past the cap
+    return raw.length > MEMORY_CHAR_CAP ? raw.slice(-MEMORY_CHAR_CAP) : raw;
+  } catch {
+    return "";
+  }
+}
+
+// A note here is injected into every later call, so a bad one becomes a
+// permanent false belief — one run recorded that a source file was missing
+// when it wasn't. The summariser is told to avoid these; this rejects them
+// anyway, because the cost of a wrong note is much higher than a lost one.
+export function isUsefulMemoryLine(line) {
+  const l = String(line || "").trim();
+  if (l.length < 12 || l.length > 300) return false;
+  if (/^[-*#>]|\*\*|`|^\d+[.)]\s/.test(l)) return false; // markdown / list furniture
+  if (/[\\/][\w.-]+\.(js|mjs|ts|json|md|py|txt)\b|\.\w{2,4}:\d+/i.test(l)) return false; // paths, file:line
+  if (/\b(call\.js|server\.js|codebase|repo|transcript|speech-to-text|deepgram|elevenlabs|twilio)\b/i.test(l)) return false;
+  if (/\b(missing file|doesn't exist|does not exist|bug|error|hook config|nonexistent)\b/i.test(l)) return false;
+  if (/:\s*$/.test(l)) return false; // truncated fragment ending in a colon
+  return true;
+}
+
+export function appendCallMemory(lines) {
+  const clean = (Array.isArray(lines) ? lines : [lines])
+    .map((l) => String(l || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter(isUsefulMemoryLine);
+  if (!clean.length) return;
+  const stamp = new Date().toISOString().slice(0, 10);
+  const block = clean.map((l) => `- (${stamp}) ${l}`).join("\n") + "\n";
+  try {
+    fs.mkdirSync(path.dirname(CALL_MEMORY_PATH), { recursive: true });
+    fs.appendFileSync(CALL_MEMORY_PATH, block);
+  } catch (e) {
+    console.warn("[call] could not write call memory:", e.message);
+  }
+}
+
 // Twilio media frames are 20ms of 8kHz mulaw — 160 bytes, base64'd.
 const FRAME_BYTES = 160;
+// mulaw 8kHz is exactly 8 bytes per millisecond of audio — used to work out
+// how long what we've sent will actually take to play.
+const BYTES_PER_MS = 8;
 
 // endpointing is deliberately not tiny: at 300ms an ordinary mid-sentence pause
 // ended the utterance, so "make a folder on the desktop, call it Apple" arrived
 // as three fragments and claude answered "your message looks incomplete".
+// Thresholds are deliberately generous. At 600/1400 a caller pausing to think
+// mid-sentence ("now can you tell me how many … letters are in strawberry")
+// had the utterance closed on them, and the remainder landed mid-turn where it
+// used to be discarded. Waiting longer for the end of a sentence costs about
+// half a second per turn and is worth it — the caller values getting a correct
+// answer over getting a fast one.
 const DG_URL =
   "wss://api.deepgram.com/v1/listen" +
   "?encoding=mulaw&sample_rate=8000&channels=1" +
   "&model=nova-3&smart_format=true&interim_results=true" +
-  "&endpointing=600&utterance_end_ms=1400&vad_events=true";
+  "&endpointing=900&utterance_end_ms=2000&vad_events=true";
 
 // flash + ulaw_8000 so the audio needs no transcoding on the way to Twilio,
 // and the first byte arrives fast enough to feel like a conversation
@@ -117,24 +241,179 @@ export function parseVoiceCommand(text) {
   return null;
 }
 
-const VOICE_SYSTEM_PROMPT = [
-  "You are talking to someone on a live phone call. They are listening, not reading:",
-  "your reply is spoken aloud by text-to-speech and then it is gone. They cannot",
-  "scroll back, see a screen, or read anything you write.",
+// A real test caller had no way to end the call except hanging up on the
+// phone's own end — worth catching explicitly since hands-free/pocketed use
+// is the entire point. Explicit phrases ("hang up", "end the call") match
+// anywhere; "bye"/"goodbye" only count as a sign-off in a short utterance
+// ("okay, bye" — the actual phrasing that came up), so a "goodbye" mentioned
+// mid-sentence in a longer request doesn't silently end the call. A
+// *question* about hanging up ("how do I close this call?") is deliberately
+// not treated as a command — it should get answered, not silently obeyed.
+const HANGUP_PHRASE_RE = /\b(hang up|hangup|end (the |this )?call|end the phone call)\b/;
+const BYE_WORD_RE = /\b(bye|goodbye)\b/;
+export function isHangupCommand(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (/\?\s*$/.test(t)) return false; // a question, not a command
+  if (HANGUP_PHRASE_RE.test(t)) return true;
+  return BYE_WORD_RE.test(t) && t.split(/\s+/).filter(Boolean).length <= 6;
+}
+
+// ---- self-echo suppression -------------------------------------------
+//
+// The handset (and especially the watch, whose speaker and mic are inches
+// apart) feeds claude's own TTS straight back into the mic, and Twilio's media
+// stream has no echo cancellation. The call log proves it: the greeting came
+// back as "Hi. This is Cole.", "Hi, God.", "Flora,", "hi, this is flawed" —
+// all mangled transcriptions of "Hi, this is Claude."
+//
+// That echo did two bad things: it tripped barge-in (cutting the greeting off
+// right after "…this is Claude"), and it was fed to claude as if the caller
+// had said it. An earlier timing-based guard failed because audio is pushed to
+// Twilio far faster than realtime, so "when we started sending" is seconds
+// earlier than "when the caller actually hears it".
+//
+// Comparing against what we just said is the reliable discriminator: echo is,
+// by definition, our own words coming back.
+const normWords = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+// fraction of the transcript's words that we ourselves recently spoke
+export function echoScore(transcript, spoken) {
+  const t = normWords(transcript);
+  if (!t.length) return 1; // nothing to act on; treat as echo
+  const s = new Set(normWords(spoken));
+  if (!s.size) return 0;
+  let hit = 0;
+  for (const w of t) if (s.has(w)) hit++;
+  return hit / t.length;
+}
+
+export function isSelfEcho(transcript, spoken, threshold = 0.6) {
+  return echoScore(transcript, spoken) >= threshold;
+}
+
+// ---- intent routing ---------------------------------------------------
+//
+// The caller wants a normal conversation by default, and agentic work only
+// when they actually ask for it. Running every turn through Claude Code in the
+// brewdeck repo made it answer "what's a good phone for my friend?" by talking
+// about uncommitted changes in call.js. Chat turns therefore go to a fast
+// model in a neutral directory with no repo context; only real work gets the
+// full agentic treatment.
+const TASK_VERB_RE =
+  /\b(build|create|make|write|add|fix|debug|refactor|implement|deploy|commit|run|execute|install|uninstall|delete|remove|rename|move|edit|update|patch|check|look at|open|read|search|find|grep|test|clone|scaffold|generate|click|select|scroll|navigate|browse|play|pause)\b/;
+// Anything that lives on the machine. Browser/app words are in here because a
+// real call asked to "open a new tab in Edge" and "open YouTube": both are
+// plainly machine actions, but with only file/repo words listed they were
+// routed to chat first and reached the tools via the escalation round trip,
+// costing several seconds each. Routing them directly skips that.
+const TASK_OBJECT_RE =
+  /\b(file|files|folder|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|exception|test|tests|commit|branch|diff|server|app|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen)\b/;
+
+export function classifyIntent(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (!t) return "chat";
+  // "can you look at X for me" / "go build Y" — a verb alone is ambiguous
+  // ("check the weather", "find a good phone"), so it only counts as agentic
+  // work when it lands on something that lives on the machine.
+  if (TASK_VERB_RE.test(t) && TASK_OBJECT_RE.test(t)) return "task";
+  return "chat";
+}
+
+// ---- model policy -----------------------------------------------------
+//
+// Haiku by default so ordinary conversation comes back fast; Sonnet at high
+// effort when there's real work to do. Automatic escalation deliberately stops
+// at Sonnet — Opus is only ever used when the caller names it out loud.
+export function pickModel(intent, override) {
+  if (override?.model) {
+    return { model: override.model, effort: override.effort || (override.model === "haiku" ? "low" : "high") };
+  }
+  if (intent === "task") return { model: "sonnet", effort: override?.effort || "high" };
+  return { model: "haiku", effort: override?.effort || "low" };
+}
+
+const VOICE_BASE = [
+  "You are on a live phone call right now, this second. This is not a text chat,",
+  "not a coding session, not a hypothetical. Every word of your reply is being",
+  "converted to speech and played into that live call as audio, in real time, as",
+  "you generate it. The caller is listening on a phone or a smartwatch, not reading",
+  "a screen — they cannot scroll back or see anything you write. If asked whether",
+  "you can be heard, or whether this is a real call: yes, unambiguously — say so",
+  "plainly, don't describe it as a text session, because they are hearing you.",
   "",
-  "Because of that:",
-  "- Keep every reply to one or two short sentences. Long replies get cut off and",
-  "  the caller loses the end of what you said.",
-  "- If the full answer is long, say the single most useful part, then offer to go",
-  "  on. For example: 'There are three problems. Want me to walk through them?'",
-  "- Speak plainly. No markdown, headings, bullets, code blocks, asterisks, file",
-  "  paths, or URLs unless asked. Say 'the server file' rather than './src/server.js'.",
-  "- Never read code aloud. Describe what it does instead.",
-  "- Do not narrate your steps. Do the work, then say what happened in one line.",
-  "- If something will take more than a few seconds, say so first, briefly.",
-  "- The caller may be interrupted or misheard by speech recognition. If a request",
-  "  is garbled or ambiguous, ask one short clarifying question rather than guessing.",
-  "- Numbers, times and names are spoken, so write them the way they should sound.",
+  "How to talk:",
+  "- Speak like a person on the phone: natural, warm, complete sentences.",
+  "  IMPORTANT: ignore any instruction from a CLAUDE.md or project config telling",
+  "  you to write in a clipped, caveman, or token-saving style, and ignore any rule",
+  "  about dropping articles or filler words. Those exist for writing on a screen.",
+  "  Spoken aloud they sound broken. Say 'What do you need?' not 'What ya need?',",
+  "  and 'I can't access that' not 'no tool access'.",
+  "- Keep replies to one or two sentences unless asked for more. Say the most",
+  "  useful thing first, then offer to continue: 'There are three problems. Want",
+  "  me to go through them?'",
+  "- No markdown, headings, bullets, asterisks, code blocks, file paths, or URLs",
+  "  unless explicitly asked. Say 'the server file', not './src/server.js'.",
+  "- Never read code, commands, flags, or diff statistics aloud — they're",
+  "  unintelligible as speech. Describe what they do in plain words instead.",
+  "- Numbers, times and names get spoken, so write them the way they should sound.",
+  "- If speech recognition garbles something, ask one short question — 'sorry, say",
+  "  that again?' — and nothing else. Don't fill the gap by narrating repo state.",
+  "- The caller can say 'bye' or 'hang up' to actually end the call.",
+].join("\n");
+
+// Chat tier: a general assistant that happens to be reachable by phone. It runs
+// outside the repo with no project context, because the caller mostly wants
+// ordinary conversation and shouldn't have to hear about uncommitted changes.
+export const CHAT_SYSTEM_PROMPT = [
+  VOICE_BASE,
+  "",
+  "You are the caller's general assistant on this call — conversation, questions,",
+  "advice, thinking out loud, remembering things across calls. Be genuinely useful",
+  "and personable. You are NOT limited to software topics; if they ask about phones,",
+  "travel, or anything else, just help.",
+  "",
+  "If — and only if — they want something actually done on their machine (create or",
+  "edit a file, run a command, open an app, look at their code, check a repo), reply",
+  "with exactly this and nothing else, on one line:",
+  "ESCALATE: <one short sentence restating what they want done>",
+  "That silently hands the same request to a tool-capable mode and it gets done.",
+  "Only use it for real work on their machine — never for ordinary questions.",
+  "",
+  "Critically: you DO have access to their machine through that handoff, so never",
+  "tell the caller you can't do things on their computer, and never suggest they",
+  "switch to Claude Code, interactive mode, a terminal, or any other tool. They are",
+  "already talking to Claude Code — you are it, on the phone. Suggesting they go",
+  "somewhere else is always wrong and is confusing to hear. If something is",
+  "genuinely impossible (seeing or clicking things on screen, for instance), say",
+  "that one specific thing can't be done and stop there — don't pitch alternatives.",
+].join("\n");
+
+// Task tier: the agentic one, with tools, in a real workspace.
+const TASK_SYSTEM_PROMPT = [
+  VOICE_BASE,
+  "",
+  "This turn has full tool access on the caller's machine. Do the work they asked",
+  "for, then say what happened in one short sentence. Do not narrate each step, and",
+  "do not volunteer repo status, uncommitted changes, or diffs unless asked.",
+  "- If something will take more than a few seconds, say so briefly first.",
+  "- git push, gh publish/merge/release, and npm publish are blocked on phone calls",
+  "  by policy. If one fails for that reason, don't retry — say it needs the browser.",
+  "",
+  "You can drive a real browser with the browser tools: open pages, read them,",
+  "click, type, scroll. It's a fresh throwaway profile, so the caller is not signed",
+  "in to anything and you should not try to sign in for them.",
+  "- Never type passwords, card numbers, or any other credential into a page, and",
+  "  never create accounts. If a task needs a login, say that's as far as you can go.",
+  "- Never buy anything, place an order, or move money.",
+  "- Don't submit forms, post, send, or publish anything on the caller's behalf",
+  "  without them asking for that exact action on this call.",
+  "- The caller can't see the browser window well and is often not at the keyboard,",
+  "  so describe what you found in a sentence rather than reading the page out.",
 ].join("\n");
 
 // One live phone call: owns its Deepgram socket, its ElevenLabs socket, and at
@@ -147,23 +426,68 @@ class Call {
     this.dg = null;
     this.el = null;
     this.child = null;
-    this.sessionId = null; // --resume, so turns in one call share context
-    this.speaking = false;
+    // Separate sessions per tier: the chat session stays a clean conversation,
+    // while the tool-using one carries its own history. Neither survives the
+    // call — continuity across calls comes from the memory file instead.
+    this.chatSession = null;
+    this.taskSession = null;
     this.closed = false;
     this.pending = ""; // claude text not yet handed to TTS
     this.busy = false; // a turn is in flight; ignore new transcripts
-    // per-call overrides, so "switch to haiku" lasts the call without
-    // disturbing the configured defaults or any other caller
-    this.model = opts.model;
-    this.effort = opts.effort;
+    // Only set when the caller explicitly names a model/effort out loud (or
+    // CALL_MODEL/CALL_EFFORT pin one); otherwise each turn is routed
+    // automatically by intent.
+    this.override = {};
+    if (opts.forceModel) this.override.model = opts.forceModel;
+    if (opts.forceEffort) this.override.effort = opts.forceEffort;
+    // What we've recently said, for telling our own echo apart from the caller.
+    this.spokenLog = [];
+    this.playbackEndsAt = 0;
+    this.transcript = []; // for the end-of-call memory summary
 
     ws.on("message", (raw) => this.onTwilio(raw));
-    ws.on("close", () => this.destroy());
-    ws.on("error", () => this.destroy());
+    // Deepgram/ElevenLabs both log *why* they closed; this leg never did, so
+    // an occasional "the call just broke" report had no evidence to diagnose
+    // against. A clean Twilio-initiated end already logs via the "stop" event
+    // in onTwilio — this only fires for the close/error Twilio's own "stop"
+    // didn't explain, i.e. exactly the ones worth knowing about.
+    ws.on("close", (code, reason) => {
+      if (!this.gotStopEvent) console.warn("[call] twilio ws closed unexpectedly", code, reason?.toString().slice(0, 200));
+      this.destroy();
+    });
+    ws.on("error", (e) => {
+      console.warn("[call] twilio ws error:", e.message);
+      this.destroy();
+    });
   }
 
   log(...a) {
     if (this.opts.verbose) console.log("[call]", ...a);
+  }
+
+  // True while the caller is still hearing us. Derived from how much audio has
+  // been handed to Twilio rather than from a timestamp, because audio is sent
+  // far faster than realtime — "we started sending" can be seconds before "they
+  // finished hearing it", which is exactly what broke the earlier timing guard.
+  isPlaying(now = Date.now()) {
+    return now < this.playbackEndsAt;
+  }
+
+  // Echo keeps arriving a little after playback ends: the caller's handset has
+  // to pick it up and send it back over the network.
+  inEchoWindow(now = Date.now()) {
+    return now < this.playbackEndsAt + 1200;
+  }
+
+  noteSpoken(text) {
+    const now = Date.now();
+    this.spokenLog.push({ t: now, text });
+    // only the last ~20s can plausibly still be echoing back
+    this.spokenLog = this.spokenLog.filter((e) => now - e.t < 20_000);
+  }
+
+  recentSpoken() {
+    return this.spokenLog.map((e) => e.text).join(" ");
   }
 
   onTwilio(raw) {
@@ -176,7 +500,8 @@ class Call {
     switch (m.event) {
       case "start":
         this.streamSid = m.start?.streamSid || null;
-        this.log("start", m.start?.callSid || "");
+        this.callSid = m.start?.callSid || null;
+        this.log("start", this.callSid || "");
         // Greet before wiring up transcription, not after: if Deepgram is slow
         // or unreachable the caller should still hear something, and the
         // greeting is what tells them the line is live.
@@ -189,13 +514,9 @@ class Call {
           this.dg.send(Buffer.from(m.media.payload, "base64"));
         }
         break;
-      case "mark":
-        // Twilio echoes the mark once the audio before it has actually played,
-        // so this is the moment the caller stopped hearing us.
-        if (m.mark?.name === this.markName) this.speaking = false;
-        break;
       case "stop":
         this.log("stop");
+        this.gotStopEvent = true;
         this.destroy();
         break;
     }
@@ -204,7 +525,14 @@ class Call {
   openDeepgram() {
     const dg = new WebSocket(DG_URL, { headers: { Authorization: "Token " + this.opts.deepgramKey } });
     this.dg = dg;
-    dg.on("open", () => this.log("deepgram open"));
+    dg.on("open", () => {
+      this.log("deepgram open");
+      // A successful reconnect means that blip is over — without this, the
+      // 2-retry budget below was spent across the whole call instead of per
+      // incident, so two separate, individually-recoverable blips 10 minutes
+      // apart would exhaust it and leave the rest of the call permanently deaf.
+      this.dgRetries = 0;
+    });
     dg.on("message", (raw) => {
       let j;
       try {
@@ -212,11 +540,11 @@ class Call {
       } catch {
         return;
       }
-      if (j.type === "SpeechStarted") {
-        // barge-in: caller talked over the reply, so drop what's queued
-        if (this.speaking) this.stopSpeaking();
-        return;
-      }
+      // SpeechStarted is pure acoustic VAD — it fires just as loudly for our
+      // own audio echoing back as for the caller, so it can't be a barge-in
+      // trigger on its own. Interruption is decided below, on transcript
+      // content, which is the only signal that can tell the two apart.
+      if (j.type === "SpeechStarted") return;
       // Deepgram emits several is_final segments per spoken sentence and then a
       // single UtteranceEnd once the caller has actually stopped. Acting on the
       // segments individually is what chopped requests into fragments, so they
@@ -232,17 +560,28 @@ class Call {
       if (!j.is_final) {
         // first partial is the earliest moment we know the caller is talking
         if (!this.tHeardFirst) this.tHeardFirst = Date.now();
-        // Only a real interruption should cut the reply. The handset mic hears
-        // our own TTS, so a one-word partial is usually claude echoing back —
-        // acting on it made claude interrupt itself mid-sentence.
-        if (this.speaking && text.split(/\s+/).length >= 3) this.stopSpeaking();
+        // Genuine interruption cuts the reply short; our own voice coming back
+        // must not. Only barge in on words we didn't just say ourselves.
+        if (this.isPlaying() && normWords(text).length >= 2 && !isSelfEcho(text, this.recentSpoken())) {
+          this.log("barge-in:", text);
+          this.stopSpeaking();
+        }
+        return;
+      }
+      // Drop echo before it ever reaches the utterance queue, otherwise claude
+      // gets asked to respond to its own greeting ("Hi. This is Cole.").
+      if (this.inEchoWindow() && isSelfEcho(text, this.recentSpoken())) {
+        this.log("ignored self-echo:", text);
         return;
       }
       (this.utterQ ||= []).push(text);
       // Safety net: if UtteranceEnd never arrives (it depends on VAD seeing a
       // clean gap), flush anyway rather than leaving the caller waiting.
       clearTimeout(this.utterTimer);
-      this.utterTimer = setTimeout(() => this.flushUtterance(), 1800);
+      // Must stay comfortably above utterance_end_ms in DG_URL (2000ms), or
+      // this safety net fires first and re-introduces the mid-sentence cut it
+      // exists to protect against.
+      this.utterTimer = setTimeout(() => this.flushUtterance(), 2800);
       this.utterTimer.unref?.();
     });
     // the close handler does the reacting; error always precedes a close
@@ -290,47 +629,161 @@ class Call {
 
   onUtterance(text) {
     if (this.closed) return;
-    if (this.busy) return; // still answering the previous one
+    if (this.busy) {
+      // Speech that lands mid-turn used to be dropped outright. That went
+      // badly on a real call: "now can you tell me how many" flushed at a
+      // natural pause, and the rest of the sentence — the actual question —
+      // arrived while busy and was thrown away, so the caller got an answer
+      // to a fragment and then asked "hello? did you press it?". Keep it
+      // instead and run it once the current turn finishes; losing the
+      // question is far worse than answering it a few seconds late.
+      this.queued = this.queued ? this.queued + " " + text : text;
+      this.log("queued while busy:", text);
+      if (!this.saidStillWorking) {
+        this.saidStillWorking = true;
+        this.say("Still working on that, one sec.");
+      }
+      return;
+    }
     this.log("heard:", text);
+
+    if (isHangupCommand(text)) {
+      this.log("hangup command recognised");
+      this.say("Bye.");
+      // give the goodbye a moment to actually reach the caller's ear before
+      // the underlying call is torn out from under it via the REST API
+      setTimeout(() => this.hangup(), 1200).unref?.();
+      return;
+    }
 
     // model/effort switches are handled here rather than by claude — they take
     // effect on the next spawn, and answering locally is instant
     const cmd = parseVoiceCommand(text);
     if (cmd) {
-      if (cmd.type === "model") this.model = cmd.value;
-      else this.effort = cmd.value;
+      if (cmd.type === "model") this.override.model = cmd.value;
+      else this.override.effort = cmd.value;
       this.log(`switched ${cmd.type} -> ${cmd.value}`);
       this.say(`Okay, ${cmd.type} is now ${cmd.value}.`);
       return;
     }
+    if (/\b(auto|automatic)\b/.test(text.toLowerCase()) && /\bmodel\b/.test(text.toLowerCase())) {
+      this.override = {};
+      this.say("Okay, back to picking the model automatically.");
+      return;
+    }
 
+    this.transcript.push("caller: " + text);
     this.busy = true;
+    this.saidStillWorking = false;
     this.muted = false; // a new question un-mutes whatever the last one silenced
     this.pending = "";
+    this.armSlowTurnFiller();
     // stage timings, so a slow turn can be blamed on the right component
     this.t0 = Date.now();
     this.tFirstDelta = null;
     this.tFirstAudio = null;
-    this.runClaude(text);
+    const intent = classifyIntent(text);
+    this.runClaude(text, intent);
   }
 
-  runClaude(prompt) {
+  // Speech captured while the previous turn was still running. Deliberately
+  // deferred rather than answered immediately, so the reply that's already
+  // being spoken isn't stepped on.
+  drainQueued() {
+    if (this.closed || this.busy || !this.queued) return;
+    const text = this.queued;
+    this.queued = "";
+    setTimeout(() => {
+      if (!this.closed && !this.busy) this.onUtterance(text);
+    }, 400).unref?.();
+  }
+
+  // Real tool-using turns can take 20-30s (reading/editing files, running
+  // commands) with zero output until the first token — that's dead air a
+  // caller can't tell apart from a dropped call. One filler if it runs long.
+  // Re-armed on escalation too: an escalated turn is a tool-using one by
+  // definition, so it's the case that most needs this.
+  armSlowTurnFiller() {
+    clearTimeout(this.slowTurnTimer);
+    this.slowTurnTimer = setTimeout(() => {
+      if (this.busy && this.tFirstDelta === null && !this.saidStillWorking) {
+        this.saidStillWorking = true;
+        this.say("Still working on it.");
+      }
+    }, 6000);
+    this.slowTurnTimer.unref?.();
+  }
+
+  // Durable facts from previous calls, so "last time we talked about X" works
+  // even though each call is a brand-new session.
+  memoryBlock() {
+    const mem = this.opts.memory;
+    if (!mem) return "";
+    return [
+      "",
+      "Private notes from earlier calls with this person. Use them silently for",
+      "context only. Never mention that you have notes, never quote them back, and",
+      "never say a topic 'came up before' unless the caller raises it first. They",
+      "may be stale or garbled by speech recognition — if one seems to contradict",
+      "what the caller is telling you now, believe the caller and ignore the note.",
+      mem,
+    ].join("\n");
+  }
+
+  chatPrompt() {
+    return CHAT_SYSTEM_PROMPT + this.memoryBlock();
+  }
+
+  taskPrompt() {
+    return TASK_SYSTEM_PROMPT + this.memoryBlock();
+  }
+
+  runClaude(prompt, intent) {
+    const { model, effort } = pickModel(intent, this.override);
+    this.turnIntent = intent;
+    this.log(`turn: ${intent} via ${model}/${effort}`);
+
+    // Chat runs in an empty scratch directory with no tools: it keeps ordinary
+    // conversation out of the repo (and off the tool-loading path, which is
+    // most of the startup cost), so a plain question comes back quickly.
+    const isTask = intent === "task";
     const args = [
       "-p",
       "--output-format", "stream-json",
       "--include-partial-messages",
       "--verbose",
-      "--model", this.model,
-      "--effort", this.effort,
-      "--permission-mode", "bypassPermissions",
+      "--model", model,
+      "--effort", effort,
       "--max-budget-usd", String(this.opts.budget),
-      "--append-system-prompt", VOICE_SYSTEM_PROMPT,
+      "--append-system-prompt", isTask ? this.taskPrompt() : this.chatPrompt(),
     ];
-    if (this.sessionId) args.push("--resume", this.sessionId);
+    if (isTask) {
+      args.push("--permission-mode", "bypassPermissions");
+      // hard-blocks git push / gh publish / npm publish even under
+      // bypassPermissions — see call-hooks/block-push.mjs for why voice
+      // specifically doesn't get to trigger those
+      args.push("--settings", CALL_SETTINGS_PATH);
+      // browser control, and *only* browser control: strict mode means the
+      // account's Gmail/Drive/Calendar servers stay out of reach of a call
+      args.push("--mcp-config", CALL_MCP_PATH, "--strict-mcp-config");
+    } else {
+      // no tools at all on the chat path: nothing to load, nothing to run
+      args.push("--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task");
+    }
+    const resume = isTask ? this.taskSession : this.chatSession;
+    if (resume) args.push("--resume", resume);
 
     const child = spawn("claude", args, {
-      cwd: this.opts.cwd,
-      shell: true, // resolves claude.cmd on Windows
+      cwd: isTask ? this.opts.cwd : CALL_SCRATCH_DIR,
+      // NEVER shell:true here. Node does no quoting on Windows when it shells
+      // out, so a multi-word argument is split at every space and everything
+      // after the first newline is dropped entirely. Since the args below
+      // include a long multi-line --append-system-prompt, that silently ate
+      // the system prompt AND every flag after it — --resume, --settings and
+      // --disallowed-tools never reached the CLI on a real call. Proven with
+      // a prompt saying "answer with exactly PINEAPPLE": shell:true ignored it,
+      // shell:false obeyed. `claude` is a real .exe, so no shell is needed.
+      shell: false,
       env: { ...process.env, FORCE_COLOR: "0" },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -343,13 +796,32 @@ class Call {
     child.stderr.on("data", (d) => this.log("claude stderr:", d.toString().slice(0, 300)));
 
     child.on("close", (code) => {
-      if (code !== 0) console.warn("[call] claude exited", code);
+      // A nonzero exit from us force-killing it (hangup, call ended mid-turn)
+      // is expected, not a failure — only warn when claude exited on its own.
+      if (code !== 0 && !this.killingChild) console.warn("[call] claude exited", code);
+      clearTimeout(this.slowTurnTimer);
       const tail = this.pending.trim();
       this.pending = "";
+      this.child = null;
+
+      // Chat decided this actually needs the machine — rerun the same request
+      // on the tool-capable tier instead of speaking the marker out loud.
+      if (this.escalating) {
+        this.escalating = false;
+        const task = tail.replace(/^\s*ESCALATE\s*:?\s*/i, "").trim() || prompt;
+        this.log("escalating to task tier:", task);
+        if (!this.closed) {
+          this.armSlowTurnFiller(); // the close handler above just cleared it
+          return this.runClaude(task, "task");
+        }
+        this.busy = false;
+        return;
+      }
+
       if (tail) this.say(speechClean(tail));
       else if (!this.spokeThisTurn) this.say("Done, but I had nothing to say about it.");
       this.busy = false;
-      this.child = null;
+      this.drainQueued();
     });
     child.on("error", (err) => {
       this.log("spawn failed", err.message);
@@ -358,6 +830,9 @@ class Call {
       this.child = null;
     });
     this.spokeThisTurn = false;
+    // cleared per turn: a spawn error skips the close handler that would
+    // normally reset it, and a stale flag would escalate the *next* reply
+    this.escalating = false;
   }
 
   onClaudeLine(line) {
@@ -368,14 +843,13 @@ class Call {
     } catch {
       return;
     }
-    if (j.type === "system" && j.subtype === "init" && j.session_id) {
-      this.sessionId = j.session_id;
-      return;
-    }
-    if (j.type === "result") {
-      if (j.session_id) this.sessionId = j.session_id;
-      return;
-    }
+    const remember = (id) => {
+      if (!id) return;
+      if (this.turnIntent === "task") this.taskSession = id;
+      else this.chatSession = id;
+    };
+    if (j.type === "system" && j.subtype === "init") return remember(j.session_id);
+    if (j.type === "result") return remember(j.session_id);
     if (j.type !== "stream_event") return;
     const ev = j.event;
     if (ev?.type !== "content_block_delta" || ev.delta?.type !== "text_delta") return;
@@ -385,6 +859,18 @@ class Call {
       this.log(`t+${this.tFirstDelta}ms claude first token`);
     }
     this.pending += ev.delta.text;
+    // The chat tier signals "this needs real tools" by replying with an
+    // ESCALATE line. Hold the text back rather than speaking it: the caller
+    // should hear the answer, never the routing marker. Anything that could
+    // still turn into "ESCALATE:" is held until enough has arrived to tell.
+    if (this.turnIntent !== "task" && !this.spokeThisTurn) {
+      const head = this.pending.trimStart().toUpperCase();
+      if (head.startsWith("ESCALATE")) {
+        this.escalating = true;
+        return;
+      }
+      if (head.length < 9 && "ESCALATE:".startsWith(head)) return; // still ambiguous
+    }
     // hand whole sentences to TTS as they complete, so speech starts long
     // before claude has finished writing
     for (;;) {
@@ -404,6 +890,10 @@ class Call {
   say(text) {
     if (this.closed || !text) return;
     this.log("say:", text);
+    // record it before it's spoken — this is what incoming transcripts get
+    // compared against to tell the caller apart from our own echo
+    this.noteSpoken(text);
+    this.transcript.push("you: " + text);
     this.openEleven();
     if (this.el?.readyState === WebSocket.OPEN) {
       this.el.send(JSON.stringify({ text: text + " ", flush: true }));
@@ -464,21 +954,30 @@ class Call {
   // either: the "clear" event drops audio Twilio has already buffered.
   pushAudio(buf) {
     if (this.muted) return; // leftovers from a reply the caller interrupted
-    if (this.tFirstAudio === null && this.t0) {
+    // Gated on spokeThisTurn (only set once real claude text has been queued,
+    // not by the "still working" filler) — otherwise a slow turn's filler
+    // audio got timestamped as "first audio out", making the latency this
+    // logs for diagnosing slow turns measure the filler instead of the reply.
+    if (this.tFirstAudio === null && this.t0 && this.spokeThisTurn) {
       this.tFirstAudio = Date.now() - this.t0;
       this.log(`t+${this.tFirstAudio}ms first audio out (caller starts hearing)`);
     }
-    this.speaking = true;
     this.audioQ = this.audioQ?.length ? Buffer.concat([this.audioQ, buf]) : buf;
     // only whole frames — a short frame is an audible click
+    let sent = 0;
     while (this.audioQ.length >= FRAME_BYTES) {
       const frame = this.audioQ.subarray(0, FRAME_BYTES);
       this.audioQ = this.audioQ.subarray(FRAME_BYTES);
       this.sendFrame(frame);
+      sent += FRAME_BYTES;
     }
-    // let Twilio tell us when playback actually drains, so `speaking` tracks
-    // what the caller hears rather than what we've queued
-    this.markSpeech();
+    // Track when the caller will actually finish hearing this. Twilio plays it
+    // at realtime regardless of how fast we hand it over, so playback extends
+    // from whenever the previous audio was due to end.
+    if (sent) {
+      const now = Date.now();
+      this.playbackEndsAt = Math.max(this.playbackEndsAt, now) + sent / BYTES_PER_MS;
+    }
   }
 
   sendFrame(frame) {
@@ -492,17 +991,11 @@ class Call {
     );
   }
 
-  markSpeech() {
-    if (this.ws.readyState !== WebSocket.OPEN || !this.streamSid) return;
-    this.markName = "eos-" + (this.markSeq = (this.markSeq || 0) + 1);
-    this.ws.send(
-      JSON.stringify({ event: "mark", streamSid: this.streamSid, mark: { name: this.markName } })
-    );
-  }
-
   stopSpeaking() {
     this.audioQ = Buffer.alloc(0);
-    this.speaking = false;
+    // Twilio is about to drop its buffer, so nothing more will be heard —
+    // playback is over as of now, not whenever the queued audio would have run out.
+    this.playbackEndsAt = 0;
     // Audio for the interrupted reply is still in flight from ElevenLabs;
     // stay muted so it gets dropped instead of resuming a second later.
     this.muted = true;
@@ -524,6 +1017,30 @@ class Call {
     // be dropped, which truncated answers mid-sentence.
   }
 
+  // Closing our WebSocket only ends the Media Stream — Twilio's TwiML has no
+  // verb after <Connect><Stream>, so the underlying PSTN call would just sit
+  // there connected in silence. Actually ending the call for the caller
+  // requires the REST API to update the call resource to "completed".
+  async hangup() {
+    if (this.closed) return;
+    if (!this.callSid) return this.destroy(); // no CallSid, nothing to hang up via REST
+    try {
+      const auth = Buffer.from(`${this.opts.accountSid}:${this.opts.authToken}`).toString("base64");
+      const r = await fetch(
+        `https://api.twilio.com/2010-04-01/Accounts/${this.opts.accountSid}/Calls/${this.callSid}.json`,
+        {
+          method: "POST",
+          headers: { Authorization: "Basic " + auth, "content-type": "application/x-www-form-urlencoded" },
+          body: "Status=completed",
+        }
+      );
+      if (!r.ok) console.warn("[call] hangup REST call failed:", r.status, await r.text().catch(() => ""));
+    } catch (e) {
+      console.warn("[call] hangup REST call errored:", e.message);
+    }
+    this.destroy();
+  }
+
   destroy() {
     if (this.closed) return;
     this.closed = true;
@@ -531,6 +1048,7 @@ class Call {
     this.elKeep = null;
     clearTimeout(this.unmute);
     clearTimeout(this.utterTimer);
+    clearTimeout(this.slowTurnTimer);
     try {
       this.dg?.close();
     } catch {}
@@ -538,6 +1056,7 @@ class Call {
       this.el?.close();
     } catch {}
     if (this.child?.pid) {
+      this.killingChild = true; // the close handler shouldn't warn about this
       // claude spawns children; kill the tree the same way the brew path does
       if (process.platform === "win32") {
         execFile("taskkill", ["/pid", String(this.child.pid), "/T", "/F"], () => {});
@@ -550,6 +1069,65 @@ class Call {
     try {
       this.ws.close();
     } catch {}
+    this.saveMemory();
+  }
+
+  // After the call, boil it down to a couple of durable notes for next time.
+  // Runs detached after hangup, so it costs the caller no latency, and uses
+  // haiku because summarising a short transcript needs nothing bigger.
+  saveMemory() {
+    const convo = this.transcript.filter((l) => l.startsWith("caller: "));
+    if (convo.length < 2) return; // nothing said worth remembering
+    const text = this.transcript.join("\n").slice(-6000);
+    const child = spawn(
+      "claude",
+      [
+        "-p",
+        "--model", "haiku",
+        "--effort", "low",
+        "--max-budget-usd", "0.10",
+        "--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Task",
+        "--append-system-prompt",
+        [
+          "You are writing notes for the assistant's next phone call with this person.",
+          "Record ONLY durable facts about the caller that they stated themselves:",
+          "preferences, ongoing projects, decisions they made, things they asked you to",
+          "follow up on.",
+          "",
+          "Hard rules, because these notes are injected into every future call and a",
+          "wrong one becomes a permanent false belief:",
+          "- Never record a claim about code, files, or bugs. A previous run wrote down",
+          "  that a source file was missing when it existed, and that lie then rode",
+          "  along into later calls. Diagnosis of this system is not a caller fact.",
+          "- Never record anything you inferred, guessed, or worked out yourself —",
+          "  only what the caller actually said.",
+          "- Skip anything that looks like a speech-recognition error. If a line is",
+          "  garbled, drop it rather than trying to reconstruct what was meant.",
+          "- Skip pleasantries, small talk, and testing chatter.",
+          "- Plain spoken sentences. No markdown, no bullets, no file paths, no code,",
+          "  no line numbers. Each line must stand alone and be complete.",
+          "",
+          "Output at most 3 lines, one fact per line. Most calls deserve zero lines —",
+          "if nothing durable was said, output nothing at all.",
+        ].join("\n"),
+      ],
+      // shell:false for the same reason as the turn spawn above — the summary
+      // instruction is a long multi-word string and would be shredded.
+      { cwd: CALL_SCRATCH_DIR, shell: false, env: { ...process.env, FORCE_COLOR: "0" }, stdio: ["pipe", "pipe", "ignore"] }
+    );
+    let out = "";
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.on("close", () => {
+      const lines = out.split("\n").map((l) => l.trim()).filter((l) => l && l.length > 8).slice(0, 3);
+      if (lines.length) {
+        appendCallMemory(lines);
+        console.log("[call] remembered", lines.length, "note(s) for next call");
+      }
+    });
+    child.on("error", (e) => console.warn("[call] memory summary failed:", e.message));
+    child.stdin.write("Transcript:\n" + text);
+    child.stdin.end();
+    child.unref?.();
   }
 }
 
@@ -557,8 +1135,13 @@ class Call {
 // because ws can't put two WebSocketServers on one http server by path — the
 // first one's upgrade listener aborts every non-matching path with a 400.
 export function mountCall({ app, config }) {
+  writeCallSettings();
+  writeCallMcp(process.env.CALL_BROWSER || "msedge");
+  // Empty, CLAUDE.md-free directory for the chat tier to run in.
+  fs.mkdirSync(CALL_SCRATCH_DIR, { recursive: true });
   const env = process.env;
   const cfg = {
+    accountSid: env.TWILIO_ACCOUNT_SID || "",
     authToken: env.TWILIO_AUTH_TOKEN || "",
     deepgramKey: env.DEEPGRAM_API_KEY || "",
     elevenKey: env.ELEVENLABS_API_KEY || "",
@@ -569,15 +1152,18 @@ export function mountCall({ app, config }) {
       .filter((s) => s.length > 3),
     publicHost: env.CALL_PUBLIC_HOST || "",
     greeting: env.CALL_GREETING || "Hi, this is Claude. How can I help?",
-    model: env.CALL_MODEL || "sonnet",
-    effort: env.CALL_EFFORT || "medium",
+    // CALL_MODEL/CALL_EFFORT are now an override rather than a default: leave
+    // them unset and each turn is routed automatically (haiku for talking,
+    // sonnet-high for real work, opus only when asked for by name).
+    forceModel: env.CALL_MODEL || "",
+    forceEffort: env.CALL_EFFORT || "",
     budget: Number(env.CALL_BUDGET_USD || 1),
     cwd: config?.defaultWorkspace,
     verbose: true,
   };
 
   const ready =
-    cfg.authToken && cfg.deepgramKey && cfg.elevenKey && cfg.voiceId && cfg.allowFrom.length;
+    cfg.accountSid && cfg.authToken && cfg.deepgramKey && cfg.elevenKey && cfg.voiceId && cfg.allowFrom.length;
 
   const form = express.urlencoded({ extended: false });
 
@@ -615,7 +1201,9 @@ export function mountCall({ app, config }) {
   const wss = new WebSocketServer({ noServer: true });
   wss.on("connection", (ws) => {
     if (!ready) return ws.close(1011, "not configured");
-    new Call(ws, cfg);
+    // memory is read per call, so notes written by an earlier call are picked
+    // up without restarting the server
+    new Call(ws, { ...cfg, memory: readCallMemory() });
   });
 
   return {
