@@ -31,28 +31,47 @@ const CALL_SETTINGS_PATH = path.join(ROOT, ".brews", "call-hook-settings.json");
 // Browser control for the task tier, so "open YouTube and play the third
 // video" can actually happen rather than being refused.
 //
-// Two deliberate choices here, both security-relevant:
-//  - Paired with --strict-mcp-config, so a call sees ONLY this server. The
-//    account has Gmail, Drive and Calendar MCP servers connected; a phone call
-//    running with permissions bypassed has no business reaching the user's
-//    email or documents, and strict mode keeps them out.
-//  - --isolated gives a throwaway browser profile rather than the real one, so
-//    a call can't act as the signed-in user on their accounts, and it can't
-//    collide with an already-running browser holding that profile open.
-// The channel (msedge/chrome) uses an already-installed browser, so nothing
-// large gets downloaded.
-const CALL_MCP_PATH = path.join(ROOT, ".brews", "call-mcp.json");
-function writeCallMcp(browser) {
-  fs.mkdirSync(path.dirname(CALL_MCP_PATH), { recursive: true });
-  const cfg = {
-    mcpServers: {
-      browser: {
-        command: "npx",
-        args: ["-y", "@playwright/mcp@latest", "--browser", browser, "--isolated", "--viewport-size", "1280,800"],
-      },
-    },
-  };
-  fs.writeFileSync(CALL_MCP_PATH, JSON.stringify(cfg, null, 2));
+// Each task-tier turn is a fresh `claude -p` process. A first version pointed
+// each one at its own `npx @playwright/mcp --isolated` server, which launches
+// a NEW browser per turn and — because the browser is a child of that MCP
+// server, itself a child of that turn's claude process — kills it the moment
+// the turn's response finishes. On a real call that looked like "it opened
+// and then closed itself" every single time, and it also meant "open YouTube
+// in the existing tab" had no existing tab to find.
+//
+// Fixed by owning the browser process ourselves, at the Call level, launched
+// once per call and torn down when the call ends. Every task-tier turn
+// connects to that same running browser via --cdp-endpoint instead of
+// spawning its own — verified directly: two separate `claude -p` processes
+// attaching to the same CDP port see the same page, survive each other
+// exiting, and only die when the owning process (us) kills them.
+//
+// Two deliberate security choices, both still in force:
+//  - Every generated config is paired with --strict-mcp-config, so a call
+//    sees ONLY the browser server. The account has Gmail, Drive and Calendar
+//    MCP servers connected; a phone call running with permissions bypassed
+//    has no business reaching the user's email or documents.
+//  - A throwaway --user-data-dir per call, not the user's real browser
+//    profile, so a call can't act as the signed-in user on their accounts.
+function findBrowserExe() {
+  if (process.env.CALL_BROWSER_EXE) return process.env.CALL_BROWSER_EXE;
+  const candidates = [
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
+}
+
+async function waitForCdp(port, tries = 25) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1000) });
+      if (r.ok) return true;
+    } catch {}
+    await new Promise((res) => setTimeout(res, 300));
+  }
+  return false;
 }
 
 function writeCallSettings() {
@@ -324,6 +343,15 @@ export function classifyIntent(text) {
   return "chat";
 }
 
+// The browser-ish subset of TASK_OBJECT_RE. A real browser has to actually be
+// launched for a task turn to use it (see ensureBrowser below), which costs a
+// few seconds and a process — not worth paying for "run the tests" or "fix
+// this bug", so only start it when the turn's own words suggest it's needed.
+const BROWSER_WORD_RE = /\b(browser|tab|window|website|url|link|youtube|spotify|chrome|edge|firefox|video|page|click|scroll|select|navigate|browse)\b/i;
+export function needsBrowser(text) {
+  return BROWSER_WORD_RE.test(String(text || ""));
+}
+
 // ---- model policy -----------------------------------------------------
 //
 // Haiku by default so ordinary conversation comes back fast; Sonnet at high
@@ -444,6 +472,10 @@ class Call {
     this.spokenLog = [];
     this.playbackEndsAt = 0;
     this.transcript = []; // for the end-of-call memory summary
+    this.cdpPort = null; // set once the call's own browser is up
+    this.browserProc = null;
+    this.browserProfileDir = null;
+    this.browserStarting = null; // in-flight ensureBrowser() promise
 
     ws.on("message", (raw) => this.onTwilio(raw));
     // Deepgram/ElevenLabs both log *why* they closed; this leg never did, so
@@ -738,7 +770,52 @@ class Call {
     return TASK_SYSTEM_PROMPT + this.memoryBlock();
   }
 
-  runClaude(prompt, intent) {
+  // Launches this call's own browser on first use and keeps it running for
+  // every later turn in the same call — see the block comment above the
+  // module-level CALL_MCP helpers for why per-turn launching broke persistence.
+  // Concurrent calls to this (two turns needing it near-simultaneously) share
+  // the one in-flight launch rather than racing two browsers into existence.
+  async ensureBrowser() {
+    if (this.cdpPort) return this.cdpPort;
+    if (this.browserStarting) return this.browserStarting;
+    this.browserStarting = (async () => {
+      const port = 9500 + Math.floor(Math.random() * 400);
+      const profileDir = path.join(os.tmpdir(), `brewdeck-call-${this.callSid || Date.now()}-profile`);
+      fs.mkdirSync(profileDir, { recursive: true });
+      const exe = findBrowserExe();
+      this.log("launching call browser:", exe, "port", port);
+      const proc = spawn(
+        exe,
+        [`--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check", "about:blank"],
+        { detached: true, stdio: "ignore" }
+      );
+      proc.unref();
+      this.browserProc = proc;
+      this.browserProfileDir = profileDir;
+      const ready = await waitForCdp(port);
+      if (!ready) {
+        console.warn("[call] browser did not become ready on port", port);
+        return null;
+      }
+      const mcpPath = path.join(os.tmpdir(), `brewdeck-call-${this.callSid || Date.now()}-mcp.json`);
+      fs.writeFileSync(
+        mcpPath,
+        JSON.stringify({ mcpServers: { browser: { command: "npx", args: ["-y", "@playwright/mcp@latest", "--cdp-endpoint", `http://127.0.0.1:${port}`] } } }, null, 2)
+      );
+      this.browserMcpPath = mcpPath;
+      this.cdpPort = port;
+      return port;
+    })();
+    const result = await this.browserStarting;
+    this.browserStarting = null;
+    return result;
+  }
+
+  // async: a task turn that plausibly needs the browser awaits the call's
+  // shared instance coming up (or already being up) before spawning claude.
+  // Callers fire this without awaiting it; failures are caught internally so
+  // a stuck browser launch can't take the whole turn down with it.
+  async runClaude(prompt, intent) {
     const { model, effort } = pickModel(intent, this.override);
     this.turnIntent = intent;
     this.log(`turn: ${intent} via ${model}/${effort}`);
@@ -747,6 +824,15 @@ class Call {
     // conversation out of the repo (and off the tool-loading path, which is
     // most of the startup cost), so a plain question comes back quickly.
     const isTask = intent === "task";
+    let browserMcpPath = null;
+    if (isTask && needsBrowser(prompt)) {
+      try {
+        if (await this.ensureBrowser()) browserMcpPath = this.browserMcpPath;
+      } catch (e) {
+        console.warn("[call] browser launch failed:", e.message);
+      }
+    }
+    if (this.closed) return; // call ended while the browser was coming up
     const args = [
       "-p",
       "--output-format", "stream-json",
@@ -763,9 +849,11 @@ class Call {
       // bypassPermissions — see call-hooks/block-push.mjs for why voice
       // specifically doesn't get to trigger those
       args.push("--settings", CALL_SETTINGS_PATH);
-      // browser control, and *only* browser control: strict mode means the
-      // account's Gmail/Drive/Calendar servers stay out of reach of a call
-      args.push("--mcp-config", CALL_MCP_PATH, "--strict-mcp-config");
+      // browser control, and *only* browser control when present: strict mode
+      // means the account's Gmail/Drive/Calendar servers stay out of reach of
+      // a call. Omitted entirely when this turn didn't need a browser, or the
+      // launch failed — the turn still runs, just without those tools.
+      if (browserMcpPath) args.push("--mcp-config", browserMcpPath, "--strict-mcp-config");
     } else {
       // no tools at all on the chat path: nothing to load, nothing to run
       args.push("--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task");
@@ -1069,7 +1157,26 @@ class Call {
     try {
       this.ws.close();
     } catch {}
+    this.killBrowser();
     this.saveMemory();
+  }
+
+  // Owned for the lifetime of this call — tear it down with it. Left running
+  // it would just be an orphaned Edge process nobody's driving.
+  killBrowser() {
+    if (this.browserProc?.pid) {
+      if (process.platform === "win32") {
+        execFile("taskkill", ["/pid", String(this.browserProc.pid), "/T", "/F"], () => {});
+      } else {
+        try {
+          process.kill(-this.browserProc.pid, "SIGKILL");
+        } catch {}
+      }
+    }
+    const profileDir = this.browserProfileDir;
+    const mcpPath = this.browserMcpPath;
+    if (profileDir) setTimeout(() => fs.rm(profileDir, { recursive: true, force: true }, () => {}), 2000).unref?.();
+    if (mcpPath) fs.rm(mcpPath, { force: true }, () => {});
   }
 
   // After the call, boil it down to a couple of durable notes for next time.
@@ -1136,7 +1243,6 @@ class Call {
 // first one's upgrade listener aborts every non-matching path with a 400.
 export function mountCall({ app, config }) {
   writeCallSettings();
-  writeCallMcp(process.env.CALL_BROWSER || "msedge");
   // Empty, CLAUDE.md-free directory for the chat tier to run in.
   fs.mkdirSync(CALL_SCRATCH_DIR, { recursive: true });
   const env = process.env;

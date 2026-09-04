@@ -16,6 +16,7 @@ import {
   pickModel,
   isUsefulMemoryLine,
   CHAT_SYSTEM_PROMPT,
+  needsBrowser,
 } from "../call.js";
 
 let failures = 0;
@@ -192,6 +193,17 @@ eq("chat prompt still defines the ESCALATE marker", /ESCALATE:/.test(CHAT_SYSTEM
 eq("chat prompt forbids suggesting a tool switch", /never suggest they\s+switch/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 eq("chat prompt asserts machine access via handoff", /you DO have access to their machine/i.test(CHAT_SYSTEM_PROMPT), true);
 eq("chat prompt says they are already talking to Claude Code", /already talking to Claude Code/i.test(CHAT_SYSTEM_PROMPT), true);
+
+// 12. Only launch a real browser process (costs a few seconds and a running
+//     Edge instance) when the turn's own words plausibly need one — actual
+//     phrases from the call that motivated the whole browser-persistence fix.
+eq("needsBrowser: open a tab", needsBrowser("open a new tab in Edge browser"), true);
+eq("needsBrowser: open youtube", needsBrowser("open YouTube in a new tab"), true);
+eq("needsBrowser: select a video", needsBrowser("select the third video"), true);
+eq("needsBrowser: click something", needsBrowser("click the search button"), true);
+eq("needsBrowser: not needed for file work", needsBrowser("fix the bug in the server code"), false);
+eq("needsBrowser: not needed for tests", needsBrowser("run the tests"), false);
+eq("needsBrowser: not needed for plain chat", needsBrowser("what's a good phone for my friend?"), false);
 
 if (failures) {
   console.error(`\n${failures} failing`);
