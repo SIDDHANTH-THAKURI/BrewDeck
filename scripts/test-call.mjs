@@ -193,6 +193,14 @@ eq("chat prompt still defines the ESCALATE marker", /ESCALATE:/.test(CHAT_SYSTEM
 eq("chat prompt forbids suggesting a tool switch", /never suggest they\s+switch/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 eq("chat prompt asserts machine access via handoff", /you DO have access to their machine/i.test(CHAT_SYSTEM_PROMPT), true);
 eq("chat prompt says they are already talking to Claude Code", /already talking to Claude Code/i.test(CHAT_SYSTEM_PROMPT), true);
+// a real call asked "can you build that yourself?" and got "no, that would need
+// Anthropic's team" — false, since capabilities are actively built into this
+// same call path in normal development sessions. A first fix still let the
+// model reword it as "the Claude Code team" and volunteer "switch to
+// interactive mode" in the same breath — both banned explicitly now, verified
+// live against the actual failing question, not just this static check.
+eq("chat prompt forbids naming any team/company for missing capabilities", /never name a team,\s*company, or product/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+eq("chat prompt forbids comparing to other modes of reaching claude", /do not compare this call to any other way/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 
 // 12. Only launch a real browser process (costs a few seconds and a running
 //     Edge instance) when the turn's own words plausibly need one — actual
