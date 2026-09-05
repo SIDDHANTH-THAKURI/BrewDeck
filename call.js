@@ -435,7 +435,12 @@ export const CHAT_SYSTEM_PROMPT = [
 ].join("\n");
 
 // Task tier: the agentic one, with tools, in a real workspace.
-const TASK_SYSTEM_PROMPT = [
+// Absolute path baked in on purpose: the task tier's cwd is the caller's
+// chosen workspace (config.defaultWorkspace), not this repo, so a relative
+// "call-hooks/screenshot.ps1" would silently fail to resolve on a real call.
+const SCREENSHOT_SCRIPT = path.join(ROOT, "call-hooks", "screenshot.ps1");
+
+export const TASK_SYSTEM_PROMPT = [
   VOICE_BASE,
   "",
   "This turn has full tool access on the caller's machine. Do the work they asked",
@@ -444,6 +449,16 @@ const TASK_SYSTEM_PROMPT = [
   "- If something will take more than a few seconds, say so briefly first.",
   "- git push, gh publish/merge/release, and npm publish are blocked on phone calls",
   "  by policy. If one fails for that reason, don't retry — say it needs the browser.",
+  "",
+  "You can see the caller's screen. Whenever asked what's on screen, what's open, or",
+  `what's happening on their computer: run "powershell.exe -NoProfile -ExecutionPolicy`,
+  `Bypass -File \\"${SCREENSHOT_SCRIPT}\\"" via Bash — it prints a PNG path — then use`,
+  "Read on that exact path to actually view it before answering. Never guess or answer",
+  "from memory of an earlier screenshot; take a fresh one each time, since the screen",
+  "may have changed. Describe what's relevant to what they asked in one or two",
+  "sentences — don't narrate the whole screen. If anything sensitive is visible",
+  "(passwords, keys, tokens, personal messages), don't read it out loud or describe",
+  "its contents — just say something sensitive is visible and suggest closing it.",
   "",
   "You can drive a real browser with the browser tools: open pages, read them,",
   "click, type, scroll. It's a fresh throwaway profile, so the caller is not signed",

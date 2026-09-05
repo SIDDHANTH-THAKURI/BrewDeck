@@ -16,6 +16,7 @@ import {
   pickModel,
   isUsefulMemoryLine,
   CHAT_SYSTEM_PROMPT,
+  TASK_SYSTEM_PROMPT,
   needsBrowser,
 } from "../call.js";
 
@@ -212,6 +213,14 @@ eq("needsBrowser: click something", needsBrowser("click the search button"), tru
 eq("needsBrowser: not needed for file work", needsBrowser("fix the bug in the server code"), false);
 eq("needsBrowser: not needed for tests", needsBrowser("run the tests"), false);
 eq("needsBrowser: not needed for plain chat", needsBrowser("what's a good phone for my friend?"), false);
+
+// 13. Screen capture — verified live against a real screenshot that the task
+//     tier correctly described visible secrets generically ("sensitive, close
+//     it") without naming which service or reading values. These assert the
+//     instructions behind that don't quietly regress.
+eq("task prompt references the screenshot script", TASK_SYSTEM_PROMPT.includes("screenshot.ps1"), true);
+eq("task prompt takes a fresh screenshot each time, not memory", /take a fresh one each time/i.test(TASK_SYSTEM_PROMPT), true);
+eq("task prompt forbids reading out sensitive on-screen content", /don't read it out loud or describe\s+its contents/i.test(TASK_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 
 if (failures) {
   console.error(`\n${failures} failing`);
