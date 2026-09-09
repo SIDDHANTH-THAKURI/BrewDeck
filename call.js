@@ -323,15 +323,24 @@ export function isSelfEcho(transcript, spoken, threshold = 0.6) {
 // about uncommitted changes in call.js. Chat turns therefore go to a fast
 // model in a neutral directory with no repo context; only real work gets the
 // full agentic treatment.
+// "see"/"show" are here specifically for screen questions — "what can you see
+// on my screen" was missing both a verb and (before screen capture existed)
+// any way to actually answer, and landed in chat, which has no idea the
+// capability exists and confidently said so was never added. Protected from
+// misfiring on ordinary usage ("I see what you mean") by the AND with
+// TASK_OBJECT_RE below — "see" alone never routes anywhere.
 const TASK_VERB_RE =
-  /\b(build|create|make|write|add|fix|debug|refactor|implement|deploy|commit|run|execute|install|uninstall|delete|remove|rename|move|edit|update|patch|check|look at|open|read|search|find|grep|test|clone|scaffold|generate|click|select|scroll|navigate|browse|play|pause)\b/;
+  /\b(build|create|make|write|add|fix|debug|refactor|implement|deploy|commit|run|execute|install|uninstall|delete|remove|rename|move|edit|update|patch|check|look at|open|read|search|find|grep|test|clone|scaffold|generate|click|select|scroll|navigate|browse|play|pause|see|show|view)\b/;
 // Anything that lives on the machine. Browser/app words are in here because a
 // real call asked to "open a new tab in Edge" and "open YouTube": both are
 // plainly machine actions, but with only file/repo words listed they were
 // routed to chat first and reached the tools via the escalation round trip,
 // costing several seconds each. Routing them directly skips that.
+// laptop/computer/pc are here because that's literally how real callers refer
+// to the machine ("what's going on in my laptop") — not in the list at all
+// before, so "view what's open on my computer" had no object word to match.
 const TASK_OBJECT_RE =
-  /\b(file|files|folder|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|exception|test|tests|commit|branch|diff|server|app|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen)\b/;
+  /\b(file|files|folder|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|exception|test|tests|commit|branch|diff|server|app|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen|laptop|computer|pc|machine)\b/;
 
 export function classifyIntent(text) {
   const t = String(text || "").toLowerCase().trim();
@@ -406,8 +415,9 @@ export const CHAT_SYSTEM_PROMPT = [
   "travel, or anything else, just help.",
   "",
   "If — and only if — they want something actually done on their machine (create or",
-  "edit a file, run a command, open an app, look at their code, check a repo), reply",
-  "with exactly this and nothing else, on one line:",
+  "edit a file, run a command, open an app, look at their code, check a repo, see",
+  "what's on their screen or what's currently open), reply with exactly this and",
+  "nothing else, on one line:",
   "ESCALATE: <one short sentence restating what they want done>",
   "That silently hands the same request to a tool-capable mode and it gets done.",
   "Only use it for real work on their machine — never for ordinary questions.",

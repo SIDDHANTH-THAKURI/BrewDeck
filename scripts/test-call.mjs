@@ -151,6 +151,17 @@ eq("task: click a video", classifyIntent("select the third video"), "task");
 eq("task: scroll the page", classifyIntent("scroll down the page a bit"), "task");
 eq("task: click a button", classifyIntent("click the search button"), "task");
 eq("chat: talking about a film, not a browser", classifyIntent("what film should I watch tonight?"), "chat");
+// a real call asked this and it landed in chat, which has no screen-capture
+// tool and confidently said the capability "hasn't been added yet" — false,
+// it shipped two days earlier. Must route to task, where the tool lives.
+eq("task: what can you see on my screen", classifyIntent("what can you see in my screen at the moment?"), "task");
+eq("task: show me my screen", classifyIntent("can you show me my screen"), "task");
+eq("task: view what's open", classifyIntent("view what's currently open on my computer"), "task");
+// ordinary uses of "see"/"show"/"view" must stay chat — only the AND with a
+// machine-object word should ever push these into task
+eq("chat: 'I see what you mean' stays chat", classifyIntent("oh I see what you mean"), "chat");
+eq("chat: 'let's see' stays chat", classifyIntent("let's see, I'm not sure"), "chat");
+eq("chat: show enthusiasm, not a screen", classifyIntent("show me you're taking this seriously"), "chat");
 
 // 9. Model policy — fast by default, sonnet for work, opus only on request
 eq("chat routes to haiku", pickModel("chat", {}), { model: "haiku", effort: "low" });
