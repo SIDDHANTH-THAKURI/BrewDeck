@@ -10,6 +10,11 @@ import {
   speechClean,
   parseVoiceCommand,
   isHangupCommand,
+  isBackgroundCommand,
+  isShortAffirmation,
+  isFollowUp,
+  parseDevNote,
+  buildThinkingTone,
   isSelfEcho,
   echoScore,
   classifyIntent,
@@ -108,6 +113,84 @@ eq("goodbye buried in a long unrelated sentence", isHangupCommand("anyway that r
 eq("empty", isHangupCommand(""), false);
 eq("ordinary request", isHangupCommand("create a new folder on desktop"), false);
 
+// 6b. Background-task detection — untangled from a real, heavily garbled call:
+//     "you are still processing in the background instead of me trying to bug
+//     you all the time" turned out to mean "let long tasks keep running
+//     without me staying on the line".
+eq("background: explicit phrase", isBackgroundCommand("can you do that in the background"), true);
+eq("background: don't wait for it", isBackgroundCommand("don't wait for it, just keep going"), true);
+eq("background: keep processing", isBackgroundCommand("keep processing in the background"), true);
+eq("background: you don't have to wait", isBackgroundCommand("you don't have to wait, I'll call back"), true);
+eq("not background: unrelated sentence", isBackgroundCommand("what's my professional background?"), false);
+eq("not background: ordinary request", isBackgroundCommand("create a new folder on desktop"), false);
+eq("not background: empty", isBackgroundCommand(""), false);
+
+// 6c. Short-affirmation detection — a real call had task tier ask "want me to
+//     look at your screen too?", caller said "Yes.", and since it matched no
+//     verb/object it fell through to chat tier's blank session, which had no
+//     idea what it was agreeing to.
+eq("affirmation: bare yes", isShortAffirmation("Yes."), true);
+eq("affirmation: yeah", isShortAffirmation("yeah"), true);
+eq("affirmation: sure", isShortAffirmation("sure"), true);
+eq("affirmation: bare no", isShortAffirmation("No."), true);
+eq("affirmation: nope", isShortAffirmation("nope"), true);
+eq("not affirmation: yes embedded in a longer sentence", isShortAffirmation("yes I want that folder redesigned"), false);
+eq("not affirmation: ordinary request", isShortAffirmation("create a new folder on desktop"), false);
+eq("not affirmation: empty", isShortAffirmation(""), false);
+
+// 6d. "Forge" marks an utterance as a message for whoever maintains this code,
+//     not a request for the assistant on the call. The caller had twice used a
+//     call to leave such a message and it was only understood on a re-read.
+eq("dev note: extracts the message", parseDevNote("Forge, commit and push the changes"), "commit and push the changes");
+eq("dev note: tolerates a colon", parseDevNote("Forge: the tone is too loud"), "the tone is too loud");
+eq("dev note: accepts the 'force' mis-hearing", parseDevNote("Force, look at the barge-in bug"), "look at the barge-in bug");
+eq("dev note: case insensitive", parseDevNote("forge fix the routing please"), "fix the routing please");
+eq("not a dev note: ordinary sentence", parseDevNote("open the new application folder"), null);
+eq("not a dev note: name with nothing after it", parseDevNote("Forge"), null);
+eq("not a dev note: forge mid-sentence", parseDevNote("I went to the forge yesterday"), null);
+eq("not a dev note: empty", parseDevNote(""), null);
+// People don't start a sentence on the wake word. Both of these are verbatim
+// from a real call and both were missed when this was anchored hard at ^, so
+// the in-call assistant answered them as ordinary chat and the messages —
+// meant for whoever reads the logs — were lost.
+eq("dev note: 'So, forge,' lead-in",
+  parseDevNote("So, forge, can you build a tool that allows mouse control"),
+  "can you build a tool that allows mouse control");
+eq("dev note: 'And also, forge,' lead-in",
+  parseDevNote("And also, forge, I would like you to disable the interruption."),
+  "I would like you to disable the interruption.");
+eq("dev note: several fillers before the name",
+  parseDevNote("Oh, my. So, forge, can you build a tool"), "can you build a tool");
+// ...but "force" is an ordinary English word, so a lead-in of arbitrary words
+// must not turn these into developer notes
+eq("not a dev note: brute force", parseDevNote("use brute force to open that file"), null);
+eq("not a dev note: may the force", parseDevNote("may the force be with you"), null);
+eq("not a dev note: force as a noun", parseDevNote("the force of the wind broke it"), null);
+// the wake word lands at the END as often as the start. Verbatim from a real
+// call, and missed: the message (the thinking tone had stopped playing) was
+// only recovered by reading the log afterwards.
+eq("dev note: wake word trailing",
+  parseDevNote("That sound you used to play while processing is lost. Fix that forge."),
+  "That sound you used to play while processing is lost. Fix that");
+eq("dev note: trailing after a comma",
+  parseDevNote("disable the interruption, forge"), "disable the interruption");
+// "force" is tolerated as a mis-hearing at the START, but a sentence ENDING in
+// "force" is virtually always the ordinary noun
+eq("not a dev note: trailing brute force", parseDevNote("use brute force"), null);
+eq("not a dev note: trailing air force", parseDevNote("call in the air force"), null);
+eq("not a dev note: trailing forge as a place", parseDevNote("I need a new forge"), null);
+
+// 6e. The thinking tone is synthesised, not shipped as an audio file — these
+//     guard the format Twilio actually requires (mulaw 8kHz, whole 20ms frames)
+//     and that it's an audible waveform rather than silence.
+{
+  const tone = buildThinkingTone();
+  eq("tone is a Buffer", Buffer.isBuffer(tone), true);
+  eq("tone is whole 160-byte frames (no click from a partial frame)", tone.length % 160, 0);
+  eq("tone is 240ms at 8 bytes/ms", tone.length / 8, 240);
+  eq("tone is an actual waveform, not silence", new Set(tone).size > 20, true);
+}
+
 // 7. Self-echo suppression. The greeting was looping out of the handset
 //    speaker back into its mic; these are the ACTUAL mis-transcriptions the
 //    call log captured of "Hi, this is Claude. How can I help?" — each one
@@ -163,6 +246,119 @@ eq("chat: 'I see what you mean' stays chat", classifyIntent("oh I see what you m
 eq("chat: 'let's see' stays chat", classifyIntent("let's see, I'm not sure"), "chat");
 eq("chat: show enthusiasm, not a screen", classifyIntent("show me you're taking this seriously"), "chat");
 
+// 8b. Natural phrasing. An audit of 36 phrasings — real ones from this user's
+// calls plus researched ways people actually word assistant requests — routed
+// 13 wrong, all of them work misfiled as tool-less chat. Measuring the
+// ESCALATE fallback on those 13 showed it rescued only 2: the chat tier
+// mostly replied with a clarifying question ("Which spreadsheet?") that it had
+// no tools to act on, so the work simply never happened. These lock in the
+// phrasings that broke it.
+//
+// inflected forms: bare imperatives matched, nothing else did
+eq("task: gerund verb", classifyIntent("would you mind opening spotify for me?"), "task");
+eq("task: -ing with doubled consonant", classifyIntent("mind grabbing that log file for me"), "task");
+eq("task: past tense", classifyIntent("redesign that folder we created on the desktop"), "task");
+// verbs that were missing from the list entirely
+eq("task: close", classifyIntent("close the browser"), "task");
+eq("task: restart", classifyIntent("restart the server"), "task");
+eq("task: kill a process", classifyIntent("kill that process for me"), "task");
+// particle verbs
+eq("task: pull up", classifyIntent("do you think you could pull up that spreadsheet?"), "task");
+eq("task: clean up", classifyIntent("is there any way you could clean up my desktop?"), "task");
+eq("task: shut down", classifyIntent("shut down chrome please"), "task");
+// requests phrased as questions — research says these are as common as commands
+eq("task: question-shaped request", classifyIntent("can you check if node is installed?"), "task");
+eq("task: polite hedge", classifyIntent("if you could just open notepad that'd be great"), "task");
+// implicit requests carrying a need or a problem but no verb at all
+eq("task: states a need", classifyIntent("I need that report from yesterday"), "task");
+eq("task: states a problem", classifyIntent("something's wrong with the server"), "task");
+eq("task: won't start", classifyIntent("the server won't start"), "task");
+eq("task: what's on my screen", classifyIntent("what's on my screen right now"), "task");
+// ...but a need or problem about something that isn't the machine is chat
+eq("chat: need unrelated to the machine", classifyIntent("I need to sleep earlier"), "chat");
+eq("chat: problem with a body part", classifyIntent("something's wrong with my knee"), "chat");
+eq("chat: broken phone, not this machine", classifyIntent("my phone screen is broken"), "chat");
+eq("chat: can't find a coffee shop", classifyIntent("can't find a decent coffee place nearby"), "chat");
+// words that are both a verb and an object ("test", "build", "commit") once
+// satisfied the verb-AND-object rule on their own, routing ordinary talk to
+// the tool tier; verb and object must now be two different words
+eq("chat: 'test' as a school test", classifyIntent("the test at school went badly"), "chat");
+eq("chat: 'build' as a job title", classifyIntent("what does a build engineer actually do?"), "chat");
+eq("task: verb and object are distinct words", classifyIntent("run the tests"), "task");
+// ...except verbs that mean machine work and nothing else, which stand alone
+eq("task: commit with no object", classifyIntent("go ahead and commit that"), "task");
+// machine words used innocently in conversation
+eq("chat: video games", classifyIntent("do you play any video games?"), "chat");
+eq("chat: page of a book", classifyIntent("I read a page of that book last night"), "chat");
+eq("chat: laptop shopping", classifyIntent("what's the best laptop to buy right now?"), "chat");
+eq("chat: python as a topic", classifyIntent("is python hard to learn?"), "chat");
+// asked on a real call right after the browser couldn't click a native dialog;
+// routed to the tool-less tier, which replied that it couldn't do it and
+// couldn't add it either — both false
+eq("task: mouse control", classifyIntent("can you build a tool that gives you mouse control"), "task");
+eq("task: native dialog", classifyIntent("click the got it button on that popup"), "task");
+eq("task: move the cursor", classifyIntent("move the cursor to the top right"), "task");
+eq("chat: a mouse in the kitchen", classifyIntent("I saw a mouse in the kitchen"), "chat");
+// caught live, mid-call: "open" had no object to land on because callers say
+// the actual address, not the words "website" or "url"
+eq("task: bare domain", classifyIntent("Can you open wikipedia.com?"), "task");
+eq("task: domain with more work", classifyIntent("go to github.com and check the issues"), "task");
+eq("chat: an email address is not a request", classifyIntent("my email is bob@gmail.com"), "chat");
+eq("chat: asking about a company, not opening it", classifyIntent("what is amazon.com worth?"), "chat");
+eq("needsBrowser: a spoken address", needsBrowser("Can you open wikipedia.com?"), true);
+
+// 8c. Follow-ups inherit the previous tier. Caught live: a task turn opened the
+// wrong site (speech recognition heard "wikipedia.com" as "wwpa.com"), and the
+// caller's two corrections — "Wrong website. It should be wikipedia.com." then
+// just "Wikipedia." — both classified as chat, so the tier with no browser was
+// asked to fix a browser the other tier had open.
+eq("follow-up: an explicit correction", isFollowUp("Wrong website. It should be wikipedia.com."), true);
+eq("follow-up: a one-word answer", isFollowUp("Wikipedia."), true);
+eq("follow-up: picking a different option", isFollowUp("no, the other one"), true);
+eq("follow-up: retry with a new target", isFollowUp("try again with youtube"), true);
+// a full sentence stands on its own and gets classified normally
+eq("not a follow-up: a fresh question", isFollowUp("what is the weather like tomorrow in sydney"), false);
+eq("not a follow-up: a request for more detail", isFollowUp("tell me more about that please"), false);
+eq("not a follow-up: empty", isFollowUp(""), false);
+// the only verb here ("build") is also an object word while the real object
+// ("mouse") sits elsewhere — requiring a verb that is no object dropped this
+eq("task: verb doubles as an object, real object elsewhere",
+  classifyIntent("build a tool for mouse control"), "task");
+
+// 8d. The inversion. Every routing miss across a session of live calls was a
+// missing WORD (close, restart, mouse, wikipedia, maximize), each sending real
+// work to the tool-less tier and costing a ~7s escalation to recover. Word
+// lists don't converge, so the default flipped: request shapes are work,
+// knowledge-seeking is conversation. None of the cases below needed a word
+// added to any list — that is the point of them.
+eq("inversion: vague request", classifyIntent("can you make it bigger"), "task");
+eq("inversion: polite imperative", classifyIntent("please close that"), "task");
+eq("inversion: no nameable object", classifyIntent("could you get rid of that thing"), "task");
+eq("inversion: bare screen action", classifyIntent("scroll down"), "task");
+eq("inversion: single word", classifyIntent("maximize"), "task");
+eq("inversion: 'i need you to'", classifyIntent("i need you to fix that"), "task");
+eq("inversion: 'is there any way'", classifyIntent("is there any way to hide that"), "task");
+eq("inversion: 'mind ...ing ... for me'", classifyIntent("mind having a look at that for me"), "task");
+// ...and the other half: a question is still a question
+eq("inversion: knowledge behind a request form",
+  classifyIntent("can you tell me about electric cars"), "chat");
+eq("inversion: knowledge topic with an action verb",
+  classifyIntent("check the weather for tomorrow"), "chat");
+eq("inversion: explain something abstract",
+  classifyIntent("could you explain quantum computing"), "chat");
+// ability questions wear a request's clothes and are the main false-positive
+// risk the inversion introduces — found by holding these out while designing it
+eq("inversion: ability question", classifyIntent("can you speak french?"), "chat");
+eq("inversion: ability question, short", classifyIntent("can you sing?"), "chat");
+eq("inversion: asking for advice", classifyIntent("can you give me some advice?"), "chat");
+eq("inversion: asking about being wrong", classifyIntent("could you be wrong about that?"), "chat");
+eq("inversion: help me understand", classifyIntent("can you help me understand how mortgages work?"), "chat");
+// ...but the same words with something real to act on are work again
+eq("inversion: 'help me' with a real object", classifyIntent("can you help me close that tab"), "task");
+// idioms that begin with an action verb now that bare imperatives can route
+eq("inversion: 'see you later' is not a screen request", classifyIntent("see you later"), "chat");
+eq("inversion: 'let's see' is a filler", classifyIntent("let's see, I'm not sure"), "chat");
+
 // 9. Model policy — fast by default, sonnet for work, opus only on request
 eq("chat routes to haiku", pickModel("chat", {}), { model: "haiku", effort: "low" });
 eq("task escalates to sonnet high", pickModel("task", {}), { model: "sonnet", effort: "high" });
@@ -202,6 +398,10 @@ eq("keeps a follow-up promise", isUsefulMemoryLine("Asked to be reminded about r
 //     call. These assert the instructions that stop that recurring, and are
 //     static so an accidental prompt edit can't quietly drop them.
 eq("chat prompt still defines the ESCALATE marker", /ESCALATE:/.test(CHAT_SYSTEM_PROMPT), true);
+// measured: of 13 real work requests that reached the chat tier, it escalated
+// only 2 and answered 11 with a clarifying question it had no tools to act on
+eq("chat prompt says to escalate without asking for missing details",
+  /Escalate even when details are missing/i.test(CHAT_SYSTEM_PROMPT), true);
 eq("chat prompt forbids suggesting a tool switch", /never suggest they\s+switch/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 eq("chat prompt asserts machine access via handoff", /you DO have access to their machine/i.test(CHAT_SYSTEM_PROMPT), true);
 eq("chat prompt says they are already talking to Claude Code", /already talking to Claude Code/i.test(CHAT_SYSTEM_PROMPT), true);
@@ -213,6 +413,11 @@ eq("chat prompt says they are already talking to Claude Code", /already talking 
 // live against the actual failing question, not just this static check.
 eq("chat prompt forbids naming any team/company for missing capabilities", /never name a team,\s*company, or product/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 eq("chat prompt forbids comparing to other modes of reaching claude", /do not compare this call to any other way/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+// a real call gathered a folder name across turns, then chat tier said "I'm
+// looking at that folder now and I'll redesign it" — a flat lie, no tools, and
+// the actual work never happened; the caller found out only at hang-up.
+eq("chat prompt forbids claiming to already be doing/checking/working on something", /never\s+say or imply you are already doing/i.test(CHAT_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+eq("chat prompt says gathering details then getting them is the moment to escalate", /that is the moment to ESCALATE/i.test(CHAT_SYSTEM_PROMPT), true);
 
 // 12. Only launch a real browser process (costs a few seconds and a running
 //     Edge instance) when the turn's own words plausibly need one — actual
@@ -230,8 +435,30 @@ eq("needsBrowser: not needed for plain chat", needsBrowser("what's a good phone 
 //     it") without naming which service or reading values. These assert the
 //     instructions behind that don't quietly regress.
 eq("task prompt references the screenshot script", TASK_SYSTEM_PROMPT.includes("screenshot.ps1"), true);
-eq("task prompt takes a fresh screenshot each time, not memory", /take a fresh one each time/i.test(TASK_SYSTEM_PROMPT), true);
-eq("task prompt forbids reading out sensitive on-screen content", /don't read it out loud or describe\s+its contents/i.test(TASK_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+// native input: the browser tools reach DOM nodes only, so clicking a native
+// dialog needs this path to be described or it may as well not exist
+eq("task prompt references the native input script", TASK_SYSTEM_PROMPT.includes("input.ps1"), true);
+// a click lands on the front window, not on whatever was in the screenshot —
+// a real call clicked the wrong application and still reported success
+eq("task prompt requires focusing the window before clicking",
+  /focus the target window/i.test(TASK_SYSTEM_PROMPT), true);
+eq("task prompt makes the confirming screenshot mandatory",
+  /not optional/i.test(TASK_SYSTEM_PROMPT), true);
+eq("task prompt forbids claiming a click that wasn't verified",
+  /Never say you clicked/i.test(TASK_SYSTEM_PROMPT), true);
+eq("task prompt lists the window-listing action",
+  /-Action windows/.test(TASK_SYSTEM_PROMPT), true);
+eq("task prompt forbids typing credentials with native input",
+  /never type passwords/i.test(TASK_SYSTEM_PROMPT), true);
+eq("task prompt takes a fresh screenshot each time, not memory", /always fresh; never answer from an earlier screenshot/i.test(TASK_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+eq("task prompt forbids reading out sensitive on-screen content", /don't read it out or describe it/i.test(TASK_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+// two real calls: "can you see my screen?" answered as a hearing/live-call
+// confirmation with no screenshot ever taken. A first fix (embedding the
+// failure narrative into the prompt text) didn't reliably land — verified
+// live, re-broke the same way — so these check the rule is direct and that
+// hearing vs seeing are explicitly kept apart.
+eq("voice base treats seeing and hearing as unrelated", /they are unrelated/i.test(CHAT_SYSTEM_PROMPT), true);
+eq("task prompt: seeing-the-screen is an instruction, not a capability question", /never a yes\/no question to answer without/i.test(TASK_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
 
 if (failures) {
   console.error(`\n${failures} failing`);

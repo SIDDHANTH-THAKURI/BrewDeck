@@ -155,6 +155,64 @@ const FRAME_BYTES = 160;
 // how long what we've sent will actually take to play.
 const BYTES_PER_MS = 8;
 
+// ---- "still thinking" tone -------------------------------------------
+//
+// The caller can't tell a long task from a dropped call, and said so: they
+// want something audible while claude is working so they know whether it's
+// safe to interrupt. A spoken filler every few seconds is too intrusive for
+// that — a short soft tone reads as "still here, still going" without
+// competing with speech.
+//
+// Synthesised rather than shipped as an audio file: it's a few lines of
+// arithmetic, needs no binary asset in the repo, and Twilio wants mulaw 8kHz
+// anyway, which is what this produces directly.
+
+// Standard G.711 mu-law encode of one 16-bit signed PCM sample.
+function pcmToMulaw(sample) {
+  const BIAS = 0x84;
+  const CLIP = 32635;
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; exponent--, mask >>= 1);
+  const mantissa = (sample >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+
+// A short, quiet two-note blip. Deliberately low amplitude and well under a
+// second so it sits under the conversation rather than talking over it.
+export function buildThinkingTone() {
+  const rate = 8000;
+  const notes = [
+    { hz: 520, ms: 90 },
+    { hz: 0, ms: 60 }, // brief gap so it reads as two taps, not one buzz
+    { hz: 660, ms: 90 },
+  ];
+  const total = notes.reduce((n, x) => n + Math.round((x.ms * rate) / 1000), 0);
+  const out = Buffer.alloc(total);
+  let i = 0;
+  for (const note of notes) {
+    const samples = Math.round((note.ms * rate) / 1000);
+    for (let s = 0; s < samples; s++) {
+      let pcm = 0;
+      if (note.hz > 0) {
+        // fade in/out so each tap doesn't click at its edges
+        const fade = Math.min(1, Math.min(s, samples - s) / (rate * 0.02));
+        pcm = Math.round(Math.sin((2 * Math.PI * note.hz * s) / rate) * 2600 * fade);
+      }
+      out[i++] = pcmToMulaw(pcm);
+    }
+  }
+  return out;
+}
+const THINKING_TONE = buildThinkingTone();
+// How long the line has to be quiet before a thinking tone counts as filling
+// silence rather than interrupting. Comfortably longer than the beat between
+// two sentences of one reply, comfortably shorter than a caller's patience.
+const TONE_QUIET_MS = 2500;
+
 // endpointing is deliberately not tiny: at 300ms an ordinary mid-sentence pause
 // ended the utterance, so "make a folder on the desktop, call it Apple" arrived
 // as three fragments and claude answered "your message looks incomplete".
@@ -164,11 +222,35 @@ const BYTES_PER_MS = 8;
 // used to be discarded. Waiting longer for the end of a sentence costs about
 // half a second per turn and is worth it — the caller values getting a correct
 // answer over getting a fast one.
+// Raised again to 3000 at the caller's explicit request, made on a call where
+// one sentence of theirs — "so forge, can you build a tool that / allows my
+// cloud to access / mouse control or whatever the way / it can to be able to
+// click on things like that" — was cut into four separate turns, each firing
+// its own claude run and its own "still working on it" filler. They asked for
+// exactly this: "make it so that I'll be able to speak along, like if I do a
+// three second pause, then you can disconnect and continue with processing."
+// utterance_end_ms is the lever that decides a turn is over; endpointing only
+// segments the text along the way, so it stays lower.
+const UTTERANCE_END_MS = 3000;
+
+// Nova-3 keyterm prompting. Phone audio is 8kHz and narrowband, which is where
+// proper nouns fall apart: a live call asking to "open wikipedia.com" was
+// transcribed "Me open wwpa.com.", so the routing was right and the target was
+// wrong. These are the words this caller actually says — site names, app
+// names, and the "forge" wake word, whose whole job is to be recognised.
+const DG_KEYTERMS = [
+  "forge", "brewdeck", "claude",
+  "wikipedia", "youtube", "google", "gmail", "github", "spotify", "chatgpt",
+  "reddit", "amazon", "netflix", "whatsapp", "outlook", "notepad", "explorer",
+  "chrome", "edge", "firefox", "taskbar", "screenshot", "desktop",
+  "dot com", "dot org", "dot net",
+];
 const DG_URL =
   "wss://api.deepgram.com/v1/listen" +
   "?encoding=mulaw&sample_rate=8000&channels=1" +
   "&model=nova-3&smart_format=true&interim_results=true" +
-  "&endpointing=900&utterance_end_ms=2000&vad_events=true";
+  `&endpointing=1100&utterance_end_ms=${UTTERANCE_END_MS}&vad_events=true` +
+  DG_KEYTERMS.map((k) => `&keyterm=${encodeURIComponent(k)}`).join("");
 
 // flash + ulaw_8000 so the audio needs no transcoding on the way to Twilio,
 // and the first byte arrives fast enough to feel like a conversation
@@ -277,6 +359,107 @@ export function isHangupCommand(text) {
   return BYE_WORD_RE.test(t) && t.split(/\s+/).filter(Boolean).length <= 6;
 }
 
+// A caller asked (garbled by speech recognition, but clear in intent once
+// untangled) for long tasks to keep running without them staying on the line
+// waiting for each one — "you are still processing in the background instead
+// of me trying to bug you all the time". Anchored on "background" plus a
+// don't-wait framing so it doesn't fire on an unrelated sentence that happens
+// to contain the word.
+const BACKGROUND_RE =
+  /\b(in the background|run it in the background|do (it|that|this) in the background|work on it in the background|don'?t wait for (it|that|this)|you don'?t have to wait|keep (working|processing) (on|in) the background|background task)\b/;
+export function isBackgroundCommand(text) {
+  return BACKGROUND_RE.test(String(text || "").toLowerCase());
+}
+
+// The caller has twice now used a call to leave a message for whoever is
+// reading these logs and working on this code, rather than for the assistant
+// on the call — once to say "commit and push", once to ask for background
+// processing. Both times it only became clear on a re-read, after the in-call
+// assistant had already tried to answer it as if it were a request.
+//
+// "Forge" marks the rest of the utterance as one of those messages: it gets
+// logged distinctly and is NOT run through chat or task at all. The name is a
+// real word (STT transcribes it far more reliably than an invented one),
+// phonetically distinct, and unlikely to open a sentence by accident.
+// "Force"/"forged" are accepted as the near-misses speech recognition
+// actually produces for it.
+// People don't start a sentence on the wake word. Two real messages meant for
+// the developer side — "So, forge, can you build a tool that..." and "And
+// also, forge, I would like you to disable the interruption" — were both
+// missed because this was anchored hard at ^, and each was answered by the
+// in-call assistant as ordinary chat instead. A lead-in is now allowed, but
+// only of recognised discourse fillers: "force" is an ordinary English word,
+// so matching it anywhere would turn "use brute force" and "may the force be
+// with you" into developer notes.
+const DEV_LEAD_IN =
+  "(?:(?:oh|my|so|and|also|ok|okay|um|uh|er|hey|yeah|yep|right|well|but|now|then|please|god|hi|hello)\\b[\\s,.!?-]+){0,4}";
+const DEV_NOTE_RE = new RegExp(`^\\s*${DEV_LEAD_IN}(forge|forged|force|forj|fordge)\\b[,:.]?\\s+(.+)$`, "i");
+// ...and it lands at the end just as often: "That sound you used to play while
+// processing is lost. Fix that forge." was a real message for the developer
+// side, missed because only a leading wake word was recognised. The guard is
+// the word in front of it — "the forge", "a forge", "my forge" are the noun,
+// not the name, so those stay ordinary speech.
+// "force" is deliberately NOT accepted in the trailing position, even though
+// it is the mis-hearing the leading form has to tolerate: a sentence that ends
+// in "force" is almost always using the noun ("use brute force", "call in the
+// air force"), so accepting it there turns ordinary speech into notes.
+const DEV_TRAIL_RE = /^(.*\S)[\s,]+(?:forge|forged|forj|fordge)\s*[.!?]*$/i;
+const NOUN_BEFORE_RE = /\b(?:the|a|an|my|your|his|her|its|our|their|old|new|iron|village|blacksmith)$/i;
+
+export function parseDevNote(text) {
+  const t = String(text || "").trim();
+  const m = DEV_NOTE_RE.exec(t);
+  if (m) return m[2].trim() || null;
+  const tail = DEV_TRAIL_RE.exec(t);
+  if (tail) {
+    const note = tail[1].trim().replace(/[,;:]+$/, "");
+    // "I went to the forge" is a place; "fix that, forge" is a name
+    if (note && !NOUN_BEFORE_RE.test(note)) return note;
+  }
+  return null;
+}
+
+// A real call surfaced this: task tier asked "want me to take a look at your
+// screen too?", the caller said "Yes.", and since a bare "yes" matches no verb
+// or object it fell through to chat tier by default — a completely separate
+// session with no idea what it was agreeing to. It answered as if nothing had
+// been asked. A short yes/no reply is a confirmation of whatever was JUST
+// asked, so it belongs wherever that question came from, not wherever
+// classifyIntent's regex would otherwise send a contentless reply.
+const SHORT_AFFIRMATION_RE = /^(yes|yeah|yep|yup|sure|okay|ok|correct|right|no|nope|nah|not really|negative)[.!]?$/;
+export function isShortAffirmation(text) {
+  const t = String(text || "").toLowerCase().trim();
+  return SHORT_AFFIRMATION_RE.test(t);
+}
+
+// A correction or a one-word answer continues the turn before it rather than
+// starting a new one, and neither carries enough on its own to classify. Seen
+// live, back to back, right after a task turn opened the wrong site: "Wrong
+// website. It should be wikipedia.com." and then just "Wikipedia." — both went
+// to the tool-less tier, which had no browser to fix anything with, while the
+// browser the caller was correcting sat open in the other tier.
+//
+// This only ever *inherits* the previous tier, never forces the task one, so a
+// short reply in the middle of an ordinary conversation stays chat.
+const CORRECTION_RE =
+  /\b(?:wrong|not that|not the|no,? i (?:meant|said)|i meant|it should be|should have been|instead|try again|the other one|nope|nah|different one)\b/;
+export function isFollowUp(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (!t) return false;
+  if (CORRECTION_RE.test(t)) return true;
+  // a very short utterance is almost always the missing detail the previous
+  // turn was waiting on ("Wikipedia.", "the second one", "downloads")
+  if (t.split(/\s+/).filter(Boolean).length <= 3) return true;
+  // "Can you click it and dismiss it?" — a real action verb whose only object
+  // is a pronoun pointing at whatever the last turn was about. Seen live,
+  // straight after a screenshot turn: it routed to chat, so the request to
+  // click something on screen went to the tier with no mouse. Requires the
+  // sentence to name no object of its own, so "click the save button" still
+  // classifies normally on its own merits.
+  return TASK_VERB_RE.test(t) && PRONOUN_REF_RE.test(t) && !TASK_OBJECT_RE.test(t);
+}
+const PRONOUN_REF_RE = /\b(?:it|that|this|them|those|these|one|there|again)\b/;
+
 // ---- self-echo suppression -------------------------------------------
 //
 // The handset (and especially the watch, whose speaker and mic are inches
@@ -329,8 +512,112 @@ export function isSelfEcho(transcript, spoken, threshold = 0.6) {
 // capability exists and confidently said so was never added. Protected from
 // misfiring on ordinary usage ("I see what you mean") by the AND with
 // TASK_OBJECT_RE below — "see" alone never routes anywhere.
-const TASK_VERB_RE =
-  /\b(build|create|make|write|add|fix|debug|refactor|implement|deploy|commit|run|execute|install|uninstall|delete|remove|rename|move|edit|update|patch|check|look at|open|read|search|find|grep|test|clone|scaffold|generate|click|select|scroll|navigate|browse|play|pause|see|show|view)\b/;
+// Speech is not command syntax. A measured audit of 36 real and researched
+// phrasings routed 13 wrong, every one of them work misfiled as chat, because
+// this list only ever matched bare imperative stems: "open chrome" matched but
+// "would you mind opening spotify" did not, and "close"/"restart" weren't here
+// at all. So stems are declared once below and expanded to their -s, -ed and
+// -ing forms (including doubled-consonant spellings: grab/grabbing) by
+// verbAlt. Particle verbs ("pull up", "shut down") inflect on the first word
+// and keep the particle, so "pulling up that spreadsheet" matches too.
+const TASK_VERB_STEMS = [
+  "build", "create", "make", "write", "add", "fix", "debug", "refactor",
+  "implement", "deploy", "commit", "run", "execute", "install", "uninstall",
+  "delete", "remove", "rename", "move", "edit", "update", "patch", "check",
+  "look at", "look for", "open", "read", "search", "find", "grep", "test",
+  "clone", "scaffold", "generate", "click", "select", "scroll", "navigate",
+  "browse", "play", "pause", "see", "show", "view",
+  // added after the audit: every one of these was missing outright
+  "close", "restart", "reboot", "start", "stop", "launch", "kill", "quit",
+  "shut down", "clean up", "tidy up", "pull up", "bring up", "set up",
+  "grab", "fetch", "save", "copy", "download", "upload", "print", "sort",
+  "organize", "rearrange", "design", "redesign", "switch", "empty", "clear",
+  "take", "capture", "screenshot",
+  // window management, all missing until a live call asked to "maximize this
+  // code" and it routed to the tier that cannot touch a window
+  "maximize", "minimize", "resize", "focus", "unfocus", "hide", "dismiss",
+  "bring", "drag", "snap", "zoom",
+];
+
+// "make"/"see" end in a vowel and "grab"/"run" double their final consonant,
+// so the plain stem+suffix rule produces "makeing"/"grabing". Both spellings
+// are generated rather than special-cased per word, and a few nonsense forms
+// in the alternation are harmless: nothing routes on a verb alone.
+function verbAlt(stem) {
+  const parts = stem.split(" ");
+  const head = parts[0];
+  const forms = new Set([head, head + "s"]);
+  if (head.endsWith("ee")) {
+    forms.add(head + "ing"); // see -> seeing, not "seing"
+    forms.add(head + "n");
+  } else if (head.endsWith("e")) {
+    forms.add(head + "d");
+    forms.add(head.slice(0, -1) + "ing"); // make -> making
+  } else {
+    forms.add(head + "ed");
+    forms.add(head + "ing");
+    if (/[^aeiou]y$/.test(head)) {
+      forms.add(head.slice(0, -1) + "ies");
+      forms.add(head.slice(0, -1) + "ied");
+    }
+    // single final consonant after a single vowel doubles: grab -> grabbing
+    if (/[^aeiou][aeiou][bdglmnprt]$/.test(head)) {
+      const doubled = head + head.slice(-1);
+      forms.add(doubled + "ed");
+      forms.add(doubled + "ing");
+    }
+  }
+  // longest-first so "opening" can't match as "open" + leftover
+  const alt = [...forms].sort((a, b) => b.length - a.length).join("|");
+  const headRe = `(?:${alt})`;
+  return parts.length > 1 ? `${headRe}\\s+${parts.slice(1).join("\\s+")}` : headRe;
+}
+
+const TASK_VERB_RE = new RegExp(`\\b(?:${TASK_VERB_STEMS.map(verbAlt).join("|")})\\b`);
+
+// Real requests often carry no verb at all — research on how people phrase
+// assistant requests found plain statements of a need or a problem are as
+// common as commands, and the audit confirmed it: "I need that report from
+// yesterday" and "something's wrong with the server" are both plainly work,
+// and both were routed to chat, where the tool-less tier answered with a
+// clarifying question it had no way to act on. A need/problem frame therefore
+// counts as intent, but only when it lands on a machine object — "I need a
+// coffee" and "my desktop is a mess" stay chat.
+const IMPLICIT_NEED_RE =
+  /\b(?:i need|i want|i'?m looking for|can'?t find|cannot find|couldn'?t find|something'?s wrong|something is wrong|not working|isn'?t working|is broken|are broken|is down|is failing|keeps? (?:crashing|failing|breaking)|won'?t (?:start|open|run|load|build|launch)|what'?s (?:on|in|open)|what is (?:on|in|open))\b/;
+
+// A machine word in an ordinary sentence is not a request. Most of these are
+// caught structurally by the distinct-token rule in classifyIntent, but a few
+// collocations pair a real verb with a real object and still mean nothing of
+// the sort — found by testing phrasings that were deliberately held out of the
+// set the patterns above were written against.
+// "see you later" and "take care" start with an action verb and mean nothing
+// of the sort — they only became a risk once bare imperatives could route.
+const NON_MACHINE_RE =
+  /\b(?:video games?|board games?|page of|phone screen|screen time|see you (?:later|soon|tomorrow)|take care|make sense|makes sense|take your time)\b/;
+
+// A few verbs mean machine work and nothing else, so they don't need an object
+// to prove it — "go ahead and commit that" names no object at all, and the
+// object it does name ("commit") is the verb itself. Kept deliberately short:
+// each word here is one a caller would never say about their afternoon.
+const STANDALONE_VERB_RE =
+  /\b(?:commits?|committed|deploys?|deployed|refactors?|refactored|greps?|scaffolds?|reboots?|rebooted|uninstalls?|screenshots?|npm|git)\b/;
+
+// Words that sit in both lists ("test", "build", "commit", "copy", "design")
+// used to satisfy the verb-AND-object rule all by themselves, so "the test at
+// school went badly" and "what does a build engineer do" both routed to the
+// tool tier. The verb and the object have to be two different words in the
+// sentence for it to be a request about something.
+function spans(re, t) {
+  const g = new RegExp(re.source, "g");
+  const out = [];
+  let m;
+  while ((m = g.exec(t)) !== null) {
+    out.push(`${m.index}:${m.index + m[0].length}`);
+    if (m.index === g.lastIndex) g.lastIndex++;
+  }
+  return out;
+}
 // Anything that lives on the machine. Browser/app words are in here because a
 // real call asked to "open a new tab in Edge" and "open YouTube": both are
 // plainly machine actions, but with only file/repo words listed they were
@@ -340,15 +627,80 @@ const TASK_VERB_RE =
 // to the machine ("what's going on in my laptop") — not in the list at all
 // before, so "view what's open on my computer" had no object word to match.
 const TASK_OBJECT_RE =
-  /\b(file|files|folder|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|exception|test|tests|commit|branch|diff|server|app|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen|laptop|computer|pc|machine)\b/;
+  /\b(file|files|folder|folders|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|errors|exception|test|tests|commit|branch|diff|server|app|apps|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|tabs|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen|laptop|computer|pc|machine|node|npm|python|git|build|process|port|database|spreadsheet|report|resume|document|documents|doc|docs|pdf|download|downloads|photo|photos|screenshot|folder name|mouse|cursor|pointer|keyboard|dialog|popup|prompt|icon|taskbar|start menu|desktop icon|checkbox|dropdown|menu|wikipedia|google|gmail|github|reddit|amazon|netflix|whatsapp|outlook|facebook|instagram|twitter|linkedin|discord|slack|excel|powerpoint|teams|zoom|calculator|settings|calendar|maps)\b/;
+
+// A bare domain is a machine object even though it's in no word list: a live
+// call asked "can you open wikipedia.com?" and it routed to the tool-less tier
+// because "open" had nothing to land on — "website" and "url" were listed, but
+// nobody says those out loud, they say the actual address.
+const DOMAIN_RE =
+  /\b[a-z0-9][a-z0-9-]*\.(?:com|org|net|io|co|dev|ai|app|gov|edu|uk|au|in|me|tv|xyz)\b/;
+
+// ---- the inversion ----------------------------------------------------
+//
+// Everything above is vocabulary, and vocabulary does not converge. Across one
+// session of live calls every single routing miss was a missing WORD — close,
+// restart, mouse, wikipedia, maximize — each one sending real work to the
+// tool-less tier, and each costing a ~7s escalation round trip to recover. The
+// lists get longer and the caller keeps finding the next gap.
+//
+// So the default flips. The question is no longer "did they say a word I know
+// about a thing I know", it's "is this a REQUEST or a QUESTION". A request is
+// work, whatever nouns it happens to contain; only genuine knowledge-seeking
+// belongs in chat. The asymmetry justifies it: a question wrongly sent to the
+// task tier is a few seconds slower, while a request wrongly sent to chat does
+// not happen at all.
+//
+// Asking for something, in the shapes people actually use on a phone.
+const REQUEST_FORM_RE =
+  /^(?:can|could|would|will|can'?t|couldn'?t) (?:you|u)\b|^please\b|^i (?:need|want|'?d like) you to\b|\bgo ahead and\b|^mind\b|^help me\b|^is there any way\b|^do you think you could\b|^any chance you\b/;
+// Wanting to know something, rather than wanting something done.
+// The second group are ability questions — "can you sing?", "can you speak
+// french?" — which are shaped exactly like a request and are not one. They
+// only ever apply when the sentence names nothing on the machine, so "can you
+// help me close that tab" is unaffected and still routes as work.
+const KNOWLEDGE_VERB_RE =
+  /\b(?:tell|explain|describe|summari[sz]e|define|translate|teach|recommend|suggest|think|thinks|thinking|know|remember|say|talk|chat|discuss|compare|advise|research|mean|means)\b|\b(?:speak|sing|dance|understand|learn|believe|imagine|feel|count|cook|drive|swim|keep|be wrong|be right)\b/;
+// Subjects that live in the world, not on the machine.
+const KNOWLEDGE_TOPIC_RE =
+  /\b(?:weather|news|time|date|score|recipe|restaurant|flight|hotel|price|stock|joke|fact|meaning|definition|translation|history|population|capital|holiday|movie|film|song|book|guitar|cricket|football|advice|secret|maths?|language|french|spanish|german|hindi|opinion|idea|dream|religion|politics|mortgage|mortgages|budget)\b/;
+const QUESTION_START_RE = /^(?:what|why|how|who|when|where|which|whose)\b/;
+// Imperatives that have no ordinary conversational use, so they can route on
+// their own with no object at all ("scroll down", "maximize", "refresh").
+// Deliberately narrow: a general "starts with any verb" rule sent "show me
+// you're taking this seriously" and "see you later" to the task tier.
+const IMPERATIVE_ACTION_RE =
+  /^(?:please\s+|just\s+|now\s+|go\s+)?(?:scroll|maximi[sz]e|minimi[sz]e|refresh|reload|paste|undo|redo|zoom|restart|reboot|uninstall|screenshot|click|double.?click|close|reopen|mute|unmute)\b/;
 
 export function classifyIntent(text) {
   const t = String(text || "").toLowerCase().trim();
   if (!t) return "chat";
-  // "can you look at X for me" / "go build Y" — a verb alone is ambiguous
-  // ("check the weather", "find a good phone"), so it only counts as agentic
-  // work when it lands on something that lives on the machine.
-  if (TASK_VERB_RE.test(t) && TASK_OBJECT_RE.test(t)) return "task";
+  if (NON_MACHINE_RE.test(t)) return "chat";
+  if (STANDALONE_VERB_RE.test(t)) return "task";
+
+  const objects = [...spans(TASK_OBJECT_RE, t), ...spans(DOMAIN_RE, t)];
+  const hasObject = objects.length > 0;
+  if (hasObject) {
+    // a verbless need/problem frame ("the server won't start") is its own signal
+    if (IMPLICIT_NEED_RE.test(t)) return "task";
+    // A request needs a verb and an object that are two different words in the
+    // sentence. Testing "a verb that is no object" is too strict and dropped
+    // "build a tool that gives you mouse control": the only verb (build) is also
+    // an object word, while the actual object (mouse) sits elsewhere.
+    const verbs = spans(TASK_VERB_RE, t);
+    if (verbs.some((v) => objects.some((o) => o !== v))) return "task";
+  }
+
+  // Knowledge-seeking wins over the request inversion below, so "can you tell
+  // me about electric cars" and "check the weather" stay conversation. Only
+  // applies when nothing on the machine was named — "explain this error" is
+  // still work, because there is an actual error to go and look at.
+  if (!hasObject && (KNOWLEDGE_VERB_RE.test(t) || KNOWLEDGE_TOPIC_RE.test(t) || QUESTION_START_RE.test(t))) {
+    return "chat";
+  }
+  // The inversion: anything shaped like a request is work.
+  if (REQUEST_FORM_RE.test(t)) return "task";
+  if (IMPERATIVE_ACTION_RE.test(t)) return "task";
   return "chat";
 }
 
@@ -358,7 +710,10 @@ export function classifyIntent(text) {
 // this bug", so only start it when the turn's own words suggest it's needed.
 const BROWSER_WORD_RE = /\b(browser|tab|window|website|url|link|youtube|spotify|chrome|edge|firefox|video|page|click|scroll|select|navigate|browse)\b/i;
 export function needsBrowser(text) {
-  return BROWSER_WORD_RE.test(String(text || ""));
+  const t = String(text || "");
+  // a spoken address ("open wikipedia.com") is a browser job even when none of
+  // the browser words are said out loud
+  return BROWSER_WORD_RE.test(t) || DOMAIN_RE.test(t.toLowerCase());
 }
 
 // ---- model policy -----------------------------------------------------
@@ -374,14 +729,27 @@ export function pickModel(intent, override) {
   return { model: "haiku", effort: override?.effort || "low" };
 }
 
+// The "can you hear me" rule below used to be one paragraph mixed in with
+// other guidance, phrased with a narrative aside about a real call that got
+// it wrong. Two separate real calls show that framing doesn't reliably land:
+// "can you see my screen?" kept getting the hearing/live-call answer instead
+// of a screenshot. Split into its own short, direct rule with an explicit
+// contrast, and the "why" moved here rather than into the prompt text itself
+// — asking the model to reason about a described-but-not-shown past failure
+// is a strange kind of context to hand it mid-instruction.
 const VOICE_BASE = [
   "You are on a live phone call right now, this second. This is not a text chat,",
   "not a coding session, not a hypothetical. Every word of your reply is being",
   "converted to speech and played into that live call as audio, in real time, as",
   "you generate it. The caller is listening on a phone or a smartwatch, not reading",
-  "a screen — they cannot scroll back or see anything you write. If asked whether",
-  "you can be heard, or whether this is a real call: yes, unambiguously — say so",
-  "plainly, don't describe it as a text session, because they are hearing you.",
+  "a screen — they cannot scroll back or see anything you write.",
+  "",
+  "'Can you hear me?' and 'is this a real call?' mean exactly one thing: confirm",
+  "yes, plainly, no hedging. Nothing else ever triggers that answer.",
+  "'Can you see my screen?' means something completely different — it is about",
+  "vision, not hearing, and it is an instruction to go look, not a question about",
+  "whether you're capable of it. Never answer a seeing-question with the",
+  "hearing-question's answer. They are unrelated.",
   "",
   "How to talk:",
   "- Speak like a person on the phone: natural, warm, complete sentences.",
@@ -422,6 +790,27 @@ export const CHAT_SYSTEM_PROMPT = [
   "That silently hands the same request to a tool-capable mode and it gets done.",
   "Only use it for real work on their machine — never for ordinary questions.",
   "",
+  "Escalate even when details are missing. Do not ask which file, which folder,",
+  "which server, or what they mean first — you cannot look, so a question here",
+  "just stalls; the tool-capable mode CAN look and work it out. 'I need that",
+  "report from yesterday', 'the build is broken', 'close that thing' are all",
+  "immediate ESCALATE, passing along exactly what they said. Ask a clarifying",
+  "question only if you genuinely cannot tell that they want machine work at all.",
+  "",
+  "You have no tools in this mode — you cannot look at, open, check, or work on",
+  "anything, no matter how it feels in the moment. A real call asked for a folder",
+  "name across a few turns, then once given it, this mode said 'I'm looking at that",
+  "folder now and I'll redesign it for you' — a flat lie, nothing was looked at,",
+  "nothing was ever done, and the caller found out later none of it happened. Never",
+  "say or imply you are already doing, checking, looking at, or working on",
+  "something; you are either about to ESCALATE, or you are just talking.",
+  "If you were gathering details for something they asked for earlier in this call",
+  "(a filename, a folder, which thing they meant) and they just gave you the missing",
+  "piece: that is the moment to ESCALATE, combining what they originally asked for",
+  "with the detail they just gave — do not answer as if you can now go do it",
+  "yourself, and do not ask yet another clarifying question if you already have",
+  "enough to act.",
+  "",
   "Critically: you DO have access to their machine through that handoff, so never",
   "tell the caller you can't do things on their computer, and never suggest they",
   "switch to Claude Code, interactive mode, a terminal, or any other tool. They are",
@@ -449,6 +838,21 @@ export const CHAT_SYSTEM_PROMPT = [
 // chosen workspace (config.defaultWorkspace), not this repo, so a relative
 // "call-hooks/screenshot.ps1" would silently fail to resolve on a real call.
 const SCREENSHOT_SCRIPT = path.join(ROOT, "call-hooks", "screenshot.ps1");
+// Native desktop input, for the gap the browser tools can't cover: a real call
+// found a native Edge "Got it" dialog sitting over the page, visible in a
+// screenshot but unclickable, because Playwright only reaches DOM nodes. The
+// caller asked for mouse control by name after hitting exactly that.
+const INPUT_SCRIPT = path.join(ROOT, "call-hooks", "input.ps1");
+
+// Two real calls exposed the same two mistakes here, so both rules below are
+// deliberately short and stated once rather than folded into a longer
+// paragraph: (1) "can you see my screen?" got answered as a hearing/live-call
+// confirmation with no screenshot ever taken — a first attempt at fixing this
+// added an explanation of that exact failure into the prompt text itself,
+// which didn't reliably land (verified live, re-broke the same way); moving
+// the "why" out to this comment and leaving only a direct rule is the second
+// attempt. (2) "does file X exist" took 14-18s and failed via screenshot
+// (window covering the icon) before a file-system check was tried.
 
 export const TASK_SYSTEM_PROMPT = [
   VOICE_BASE,
@@ -460,15 +864,51 @@ export const TASK_SYSTEM_PROMPT = [
   "- git push, gh publish/merge/release, and npm publish are blocked on phone calls",
   "  by policy. If one fails for that reason, don't retry — say it needs the browser.",
   "",
-  "You can see the caller's screen. Whenever asked what's on screen, what's open, or",
-  `what's happening on their computer: run "powershell.exe -NoProfile -ExecutionPolicy`,
-  `Bypass -File \\"${SCREENSHOT_SCRIPT}\\"" via Bash — it prints a PNG path — then use`,
-  "Read on that exact path to actually view it before answering. Never guess or answer",
-  "from memory of an earlier screenshot; take a fresh one each time, since the screen",
-  "may have changed. Describe what's relevant to what they asked in one or two",
-  "sentences — don't narrate the whole screen. If anything sensitive is visible",
-  "(passwords, keys, tokens, personal messages), don't read it out loud or describe",
-  "its contents — just say something sensitive is visible and suggest closing it.",
+  "If asked whether a file or folder exists, or to find/check/look for one by name:",
+  "use the file system directly (ls, Test-Path, Glob). Never a screenshot for this —",
+  "it's slower and an open window can cover the very icon you're looking for.",
+  "",
+  "'Can you see my screen?' / 'can you see what's on my screen?' is always an",
+  "instruction to look, right now — never a yes/no question to answer without",
+  "looking. The instant you hear it: take a screenshot and answer from what's",
+  "actually in it. Same for 'what's on screen', 'what's open', 'what does X look",
+  "like'. To take one, run",
+  `"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\"${SCREENSHOT_SCRIPT}\\""`,
+  "via Bash — it prints a PNG path — then Read that exact path before answering.",
+  "Always fresh; never answer from an earlier screenshot, the screen may have",
+  "changed. One or two sentences on what's relevant to the question, not a",
+  "narration of the whole screen. Sensitive content (passwords, keys, tokens,",
+  "personal messages): don't read it out or describe it, just say something",
+  "sensitive is visible and suggest closing it.",
+  "",
+  "You can also control the mouse and keyboard directly, anywhere on the desktop —",
+  "native dialogs, the taskbar, other apps, things no browser tool can reach. Run",
+  `"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\"${INPUT_SCRIPT}\\" -Action <a> ..."`,
+  "via Bash, where <a> is one of: windows | focus -Text \"edge\" | where |",
+  "move -X n -Y n | click -X n -Y n | doubleclick | rightclick |",
+  "scroll -Amount n (negative scrolls down) |",
+  "type -Text \"...\" | key -Text \"{ENTER}\" (SendKeys notation, ^c is ctrl+C).",
+  "",
+  "A click goes to whatever window is in FRONT, not to whatever was in your",
+  "screenshot. So the order is always: focus the target window, screenshot, find",
+  "the thing, click its position, screenshot again to confirm. Skipping the focus",
+  "step is what made a real call click the wrong application while reporting",
+  "success. '-Action windows' lists what can be focused if you're unsure.",
+  "Never guess at coordinates you haven't seen, and prefer the browser tools when",
+  "the target is inside a web page — this is for everything else.",
+  "- That second screenshot is not optional. On a real call this clicked nothing",
+  "  and reported 'Clicked Got it — that popup should be dismissed now'; the caller",
+  "  was looking at the screen and said 'you didn't click'. Never say you clicked,",
+  "  dismissed, closed or opened something until you have seen it change in a fresh",
+  "  screenshot. If it hasn't changed, say exactly that — 'I clicked at that spot",
+  "  and the popup is still there' — and try once more or ask where to click.",
+  "  Saying it worked when you haven't looked is the worst possible answer here:",
+  "  the caller cannot see what you did and has only your word for it.",
+  "- Browser sync prompts, 'Got it' bars, save-password bars and other Edge or",
+  "  Chrome UI live outside the page. The browser tools cannot touch them and will",
+  "  report no such element — use this native input path for those.",
+  "- This types into whatever window has focus, which the caller may be using. Don't",
+  "  use it for anything destructive, and never type passwords or card numbers.",
   "",
   "You can drive a real browser with the browser tools: open pages, read them,",
   "click, type, scroll. It's a fresh throwaway profile, so the caller is not signed",
@@ -484,7 +924,7 @@ export const TASK_SYSTEM_PROMPT = [
 
 // One live phone call: owns its Deepgram socket, its ElevenLabs socket, and at
 // most one claude child at a time. Everything here dies with the call.
-class Call {
+export class Call {
   constructor(ws, opts) {
     this.ws = ws; // socket back to Twilio
     this.opts = opts;
@@ -498,7 +938,11 @@ class Call {
     this.chatSession = null;
     this.taskSession = null;
     this.closed = false;
-    this.pending = ""; // claude text not yet handed to TTS
+    this.foregroundTurn = null; // the current blocking turn's per-turn state
+    // Whichever tier most recently finished speaking — a bare "yes"/"no" reply
+    // has no verb/object for classifyIntent to route on, so it's routed back
+    // to whichever tier just asked a question instead of defaulting to chat.
+    this.lastTurnTier = null;
     this.busy = false; // a turn is in flight; ignore new transcripts
     // Only set when the caller explicitly names a model/effort out loud (or
     // CALL_MODEL/CALL_EFFORT pin one); otherwise each turn is routed
@@ -510,6 +954,11 @@ class Call {
     this.spokenLog = [];
     this.playbackEndsAt = 0;
     this.transcript = []; // for the end-of-call memory summary
+    // Turns detached to run without blocking the call — see isBackgroundCommand.
+    // Separate from this.child (the current foreground turn) so a background
+    // turn finishing doesn't touch busy/drainQueued state that may by then
+    // belong to a completely different, later foreground turn.
+    this.backgroundChildren = [];
     this.cdpPort = null; // set once the call's own browser is up
     this.browserProc = null;
     this.browserProfileDir = null;
@@ -648,10 +1097,11 @@ class Call {
       // Safety net: if UtteranceEnd never arrives (it depends on VAD seeing a
       // clean gap), flush anyway rather than leaving the caller waiting.
       clearTimeout(this.utterTimer);
-      // Must stay comfortably above utterance_end_ms in DG_URL (2000ms), or
-      // this safety net fires first and re-introduces the mid-sentence cut it
-      // exists to protect against.
-      this.utterTimer = setTimeout(() => this.flushUtterance(), 2800);
+      // Must stay comfortably above utterance_end_ms in DG_URL, or this safety
+      // net fires first and re-introduces the mid-sentence cut it exists to
+      // protect against — derived from it rather than hardcoded, because the
+      // two were previously set independently and drifted into exactly that.
+      this.utterTimer = setTimeout(() => this.flushUtterance(), UTTERANCE_END_MS + 800);
       this.utterTimer.unref?.();
     });
     // the close handler does the reacting; error always precedes a close
@@ -699,6 +1149,23 @@ class Call {
 
   onUtterance(text) {
     if (this.closed) return;
+    // Checked before the busy gate: a note for the developer is just logged,
+    // never sent to claude, so it's safe to take immediately — and waiting
+    // for an in-flight turn to finish would be exactly the delay the caller
+    // is trying to avoid when they interrupt to leave one.
+    const devNote = parseDevNote(text);
+    if (devNote) {
+      console.warn("[call] DEV NOTE:", devNote);
+      this.transcript.push("dev note: " + devNote);
+      this.say("Noted.");
+      return;
+    }
+    if (this.busy && isBackgroundCommand(text)) {
+      this.log("backgrounding turn:", text);
+      this.detachCurrentTurn();
+      this.say("Okay, I'll keep working on that in the background. Go ahead.");
+      return;
+    }
     if (this.busy) {
       // Speech that lands mid-turn used to be dropped outright. That went
       // badly on a real call: "now can you tell me how many" flushed at a
@@ -709,10 +1176,13 @@ class Call {
       // question is far worse than answering it a few seconds late.
       this.queued = this.queued ? this.queued + " " + text : text;
       this.log("queued while busy:", text);
-      if (!this.saidStillWorking) {
-        this.saidStillWorking = true;
-        this.say("Still working on that, one sec.");
-      }
+      // Deliberately silent. This used to answer mid-sentence speech with
+      // "Still working on that, one sec.", which is the assistant talking over
+      // the caller at the exact moment they are still forming a request — on
+      // one real call a single sentence drew three of these. The caller asked
+      // for it to stop ("disable the interruption... make it so that I'll be
+      // able to speak along"), and the thinking tone already signals "still
+      // here" without using words. Their speech is still queued and answered.
       return;
     }
     this.log("heard:", text);
@@ -746,14 +1216,41 @@ class Call {
     this.busy = true;
     this.saidStillWorking = false;
     this.muted = false; // a new question un-mutes whatever the last one silenced
-    this.pending = "";
     this.armSlowTurnFiller();
     // stage timings, so a slow turn can be blamed on the right component
     this.t0 = Date.now();
     this.tFirstDelta = null;
     this.tFirstAudio = null;
-    const intent = classifyIntent(text);
+    // A bare "yes"/"no" carries no verb or object for classifyIntent to route
+    // on — it's a confirmation of whatever the LAST tier just asked, so it
+    // goes back to that same tier/session rather than defaulting to chat.
+    // ...and the same is true of a correction or a one-word answer: both
+    // continue the previous turn, so they inherit its tier instead of being
+    // classified from scratch on words that carry no verb or object.
+    const sticky = (isShortAffirmation(text) || isFollowUp(text)) && this.lastTurnTier;
+    const intent = sticky ? this.lastTurnTier : classifyIntent(text);
     this.runClaude(text, intent);
+  }
+
+  // A caller asked for a long task to keep running without the call waiting on
+  // it turn-by-turn ("you are still processing in the background instead of me
+  // trying to bug you all the time"). Moves the in-flight turn out of the
+  // blocking busy/this.child slot into backgroundChildren, so the call is free
+  // to take new questions immediately while it keeps running underneath.
+  detachCurrentTurn() {
+    const turn = this.foregroundTurn;
+    if (!turn) return;
+    turn.foreground = false;
+    this.foregroundTurn = null;
+    this.child = null; // this.child means "the current foreground child" from here on
+    this.backgroundChildren.push(turn);
+    this.busy = false;
+    this.saidStillWorking = false;
+    clearTimeout(this.slowTurnTimer);
+    // no more "still thinking" tone for a turn the caller explicitly stopped
+    // waiting on — they've moved on to talking about something else
+    this.stopThinkingTone();
+    this.drainQueued();
   }
 
   // Speech captured while the previous turn was still running. Deliberately
@@ -782,6 +1279,46 @@ class Call {
       }
     }, 6000);
     this.slowTurnTimer.unref?.();
+    this.armThinkingTone();
+  }
+
+  // Soft tone every few seconds while a turn is still thinking, so the caller
+  // can hear the difference between "working" and "line went dead" and knows
+  // whether interrupting is worth it. Stops the moment real speech starts —
+  // it exists to fill silence, not to talk over an answer.
+  armThinkingTone() {
+    clearInterval(this.thinkingTone);
+    this.thinkingTone = setInterval(() => {
+      const turn = this.foregroundTurn;
+      if (!this.busy || this.closed || !turn) {
+        clearInterval(this.thinkingTone);
+        this.thinkingTone = null;
+        return;
+      }
+      // Used to stop for good the moment the turn said anything
+      // (turn.spokeThisTurn). That made the tone vanish exactly when it was
+      // needed most: a long task turn narrates a step, then works in silence
+      // for twenty or thirty seconds, and the caller hears nothing at all. The
+      // caller noticed and reported it — "that sound you used to play while
+      // processing is lost". It now keeps going for as long as the turn does.
+      //
+      // The guard that replaces it is a quiet gap rather than "never spoke":
+      // sentences of a reply arrive a beat apart, and a tone dropped into one
+      // of those gaps would sound like an interruption. Only a silence longer
+      // than the gap between sentences counts as "still working".
+      if (Date.now() - this.playbackEndsAt < TONE_QUIET_MS) return;
+      // logged because there was otherwise no way to tell from a call log
+      // whether the caller actually heard anything during a long pause
+      this.tonesPlayed = (this.tonesPlayed || 0) + 1;
+      this.log(`thinking tone #${this.tonesPlayed} (t+${this.t0 ? Date.now() - this.t0 : "?"}ms)`);
+      this.pushAudio(Buffer.from(THINKING_TONE), { tone: true });
+    }, 2500);
+    this.thinkingTone.unref?.();
+  }
+
+  stopThinkingTone() {
+    clearInterval(this.thinkingTone);
+    this.thinkingTone = null;
   }
 
   // Durable facts from previous calls, so "last time we talked about X" works
@@ -838,7 +1375,23 @@ class Call {
       const mcpPath = path.join(os.tmpdir(), `brewdeck-call-${this.callSid || Date.now()}-mcp.json`);
       fs.writeFileSync(
         mcpPath,
-        JSON.stringify({ mcpServers: { browser: { command: "npx", args: ["-y", "@playwright/mcp@latest", "--cdp-endpoint", `http://127.0.0.1:${port}`] } } }, null, 2)
+        // "-y @playwright/mcp@latest" hit the npm registry to resolve @latest
+        // on every single browser turn, even fully cached — a real call saw
+        // this take 34s and then fail to connect at all. @playwright/mcp is
+        // now a pinned real dependency, invoked here by its absolute cli.js
+        // path rather than via npx: a task-tier turn's cwd is the caller's
+        // chosen workspace (could be anywhere), not this repo, so
+        // "npx --no-install" would resolve node_modules relative to THAT cwd
+        // and likely miss brewdeck's own install entirely. `node <abs path>`
+        // has no cwd dependency and no network involved at all.
+        JSON.stringify({
+          mcpServers: {
+            browser: {
+              command: "node",
+              args: [path.join(ROOT, "node_modules", "@playwright", "mcp", "cli.js"), "--cdp-endpoint", `http://127.0.0.1:${port}`],
+            },
+          },
+        }, null, 2)
       );
       this.browserMcpPath = mcpPath;
       this.cdpPort = port;
@@ -853,10 +1406,16 @@ class Call {
   // shared instance coming up (or already being up) before spawning claude.
   // Callers fire this without awaiting it; failures are caught internally so
   // a stuck browser launch can't take the whole turn down with it.
-  async runClaude(prompt, intent) {
+  async runClaude(prompt, intent, { background = false } = {}) {
     const { model, effort } = pickModel(intent, this.override);
-    this.turnIntent = intent;
-    this.log(`turn: ${intent} via ${model}/${effort}`);
+    this.log(`turn: ${intent} via ${model}/${effort}${background ? " (background)" : ""}`);
+    // Per-turn state, not this.*: two children can genuinely be streaming
+    // concurrently (a backgrounded one still finishing its own answer while a
+    // new foreground turn starts), and onClaudeLine used to accumulate into
+    // shared this.pending/this.spokeThisTurn — two turns' text would have
+    // interleaved and corrupted each other's speech output.
+    const turn = { pending: "", spokeThisTurn: false, escalating: false, intent, foreground: !background };
+    if (!background) this.foregroundTurn = turn;
 
     // Chat runs in an empty scratch directory with no tools: it keeps ordinary
     // conversation out of the repo (and off the tool-loading path, which is
@@ -913,55 +1472,88 @@ class Call {
       env: { ...process.env, FORCE_COLOR: "0" },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    this.child = child;
+    turn.child = child;
+    if (!background) this.child = child;
+    else this.backgroundChildren.push(turn);
     child.stdin.write(prompt);
     child.stdin.end();
 
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-    rl.on("line", (line) => this.onClaudeLine(line));
+    rl.on("line", (line) => this.onClaudeLine(line, turn));
     child.stderr.on("data", (d) => this.log("claude stderr:", d.toString().slice(0, 300)));
 
     child.on("close", (code) => {
       // A nonzero exit from us force-killing it (hangup, call ended mid-turn)
       // is expected, not a failure — only warn when claude exited on its own.
       if (code !== 0 && !this.killingChild) console.warn("[call] claude exited", code);
-      clearTimeout(this.slowTurnTimer);
-      const tail = this.pending.trim();
-      this.pending = "";
-      this.child = null;
+      const tail = turn.pending.trim();
+      turn.pending = "";
+      if (turn.foreground) {
+        clearTimeout(this.slowTurnTimer);
+        this.stopThinkingTone();
+        this.child = null;
+      } else {
+        this.backgroundChildren = this.backgroundChildren.filter((t) => t !== turn);
+      }
 
       // Chat decided this actually needs the machine — rerun the same request
       // on the tool-capable tier instead of speaking the marker out loud.
-      if (this.escalating) {
-        this.escalating = false;
+      // Propagates foreground/background: a backgrounded turn that escalates
+      // must stay backgrounded, not suddenly steal the busy/this.child slot
+      // out from under whatever foreground turn is running by then.
+      if (turn.escalating) {
         const task = tail.replace(/^\s*ESCALATE\s*:?\s*/i, "").trim() || prompt;
-        this.log("escalating to task tier:", task);
-        if (!this.closed) {
-          this.armSlowTurnFiller(); // the close handler above just cleared it
-          return this.runClaude(task, "task");
+        this.log("escalating to task tier:", task, turn.foreground ? "" : "(background)");
+        // A foreground turn can't escalate once the call's over — nothing to
+        // speak into. A background turn keeps going regardless: the whole
+        // point is that it outlives the caller hanging up.
+        if (!turn.foreground || !this.closed) {
+          if (turn.foreground) this.armSlowTurnFiller(); // close handler above just cleared it
+          return this.runClaude(task, "task", { background: !turn.foreground });
         }
         this.busy = false;
         return;
       }
 
+      // A background turn finishing while the caller's still on the line just
+      // speaks up whenever it's ready — say()/pushAudio don't require busy.
+      // If the call's already over, there's no line to speak into, so the
+      // result is handed to the caller's next call instead of being lost.
+      if (!turn.foreground && this.closed) {
+        const result = tail ? speechClean(tail) : turn.spokeThisTurn ? "" : "finished, with nothing further to report";
+        if (result) appendCallMemory(`Finished the background task you asked about: ${result}`);
+        return;
+      }
+
+      if (!turn.foreground && tail) {
+        // Announced distinctly rather than blurted as a direct reply, since
+        // the caller may be mid-conversation about something else entirely.
+        this.say("By the way, that background task finished. " + speechClean(tail));
+        return;
+      }
+
       if (tail) this.say(speechClean(tail));
-      else if (!this.spokeThisTurn) this.say("Done, but I had nothing to say about it.");
-      this.busy = false;
-      this.drainQueued();
+      else if (!turn.spokeThisTurn) this.say("Done, but I had nothing to say about it.");
+      if (turn.foreground) {
+        this.lastTurnTier = turn.intent;
+        this.busy = false;
+        this.drainQueued();
+      }
     });
     child.on("error", (err) => {
       this.log("spawn failed", err.message);
-      this.say("I couldn't start claude on the machine.");
-      this.busy = false;
-      this.child = null;
+      if (turn.foreground) {
+        this.say("I couldn't start claude on the machine.");
+        this.busy = false;
+        this.child = null;
+      } else {
+        this.backgroundChildren = this.backgroundChildren.filter((t) => t !== turn);
+        if (!this.closed) this.say("Sorry, the background task I was running just failed to start.");
+      }
     });
-    this.spokeThisTurn = false;
-    // cleared per turn: a spawn error skips the close handler that would
-    // normally reset it, and a stale flag would escalate the *next* reply
-    this.escalating = false;
   }
 
-  onClaudeLine(line) {
+  onClaudeLine(line, turn) {
     if (!line.startsWith("{")) return;
     let j;
     try {
@@ -971,7 +1563,7 @@ class Call {
     }
     const remember = (id) => {
       if (!id) return;
-      if (this.turnIntent === "task") this.taskSession = id;
+      if (turn.intent === "task") this.taskSession = id;
       else this.chatSession = id;
     };
     if (j.type === "system" && j.subtype === "init") return remember(j.session_id);
@@ -980,32 +1572,41 @@ class Call {
     const ev = j.event;
     if (ev?.type !== "content_block_delta" || ev.delta?.type !== "text_delta") return;
 
-    if (this.tFirstDelta === null && this.t0) {
+    // Diagnostic timing only tracks whichever turn is currently in the
+    // foreground — a background turn doesn't touch it, since this.t0 may by
+    // then belong to a different, later foreground turn entirely.
+    if (turn.foreground && this.tFirstDelta === null && this.t0) {
       this.tFirstDelta = Date.now() - this.t0;
       this.log(`t+${this.tFirstDelta}ms claude first token`);
     }
-    this.pending += ev.delta.text;
+    turn.pending += ev.delta.text;
     // The chat tier signals "this needs real tools" by replying with an
     // ESCALATE line. Hold the text back rather than speaking it: the caller
     // should hear the answer, never the routing marker. Anything that could
     // still turn into "ESCALATE:" is held until enough has arrived to tell.
-    if (this.turnIntent !== "task" && !this.spokeThisTurn) {
-      const head = this.pending.trimStart().toUpperCase();
+    if (turn.intent !== "task" && !turn.spokeThisTurn) {
+      const head = turn.pending.trimStart().toUpperCase();
       if (head.startsWith("ESCALATE")) {
-        this.escalating = true;
+        turn.escalating = true;
         return;
       }
       if (head.length < 9 && "ESCALATE:".startsWith(head)) return; // still ambiguous
     }
-    // hand whole sentences to TTS as they complete, so speech starts long
-    // before claude has finished writing
+    // Foreground: hand whole sentences to TTS as they complete, so speech
+    // starts long before claude has finished writing. Background: stay
+    // silent while generating — the caller may be having an entirely
+    // separate live exchange right now, and a background turn's sentences
+    // dripping in mid-conversation would interleave with it unpredictably.
+    // Its full answer is accumulated in turn.pending and announced once, at
+    // completion, by the close handler in runClaude.
+    if (!turn.foreground) return;
     for (;;) {
-      const [chunk, rest] = takeSpeakable(this.pending);
+      const [chunk, rest] = takeSpeakable(turn.pending);
       if (!chunk) break;
-      this.pending = rest;
+      turn.pending = rest;
       const clean = speechClean(chunk);
       if (clean) {
-        this.spokeThisTurn = true;
+        turn.spokeThisTurn = true;
         this.say(clean);
       }
     }
@@ -1078,13 +1679,20 @@ class Call {
   // 20ms setInterval, which on Windows (~15ms timer granularity) jittered
   // enough to make speech sound broken-up. Barge-in doesn't need pacing
   // either: the "clear" event drops audio Twilio has already buffered.
-  pushAudio(buf) {
+  pushAudio(buf, { tone = false } = {}) {
     if (this.muted) return; // leftovers from a reply the caller interrupted
-    // Gated on spokeThisTurn (only set once real claude text has been queued,
-    // not by the "still working" filler) — otherwise a slow turn's filler
-    // audio got timestamped as "first audio out", making the latency this
-    // logs for diagnosing slow turns measure the filler instead of the reply.
-    if (this.tFirstAudio === null && this.t0 && this.spokeThisTurn) {
+    // Whether the caller is currently hearing only a thinking tone rather than
+    // an actual answer. Barge-in treats the two differently: interrupting a
+    // reply must suppress the rest of it, interrupting a tone must not — there
+    // is no reply yet, and muting here would silently swallow the real answer
+    // when it finally arrives.
+    this.tonePlaying = tone;
+    // Gated on the foreground turn's spokeThisTurn (only set once real claude
+    // text has been queued, not by the "still working" filler) — otherwise a
+    // slow turn's filler audio got timestamped as "first audio out", making
+    // the latency this logs for diagnosing slow turns measure the filler
+    // instead of the reply.
+    if (this.tFirstAudio === null && this.t0 && this.foregroundTurn?.spokeThisTurn) {
       this.tFirstAudio = Date.now() - this.t0;
       this.log(`t+${this.tFirstAudio}ms first audio out (caller starts hearing)`);
     }
@@ -1118,21 +1726,31 @@ class Call {
   }
 
   stopSpeaking() {
+    const wasOnlyTone = this.tonePlaying;
     this.audioQ = Buffer.alloc(0);
     // Twilio is about to drop its buffer, so nothing more will be heard —
     // playback is over as of now, not whenever the queued audio would have run out.
     this.playbackEndsAt = 0;
-    // Audio for the interrupted reply is still in flight from ElevenLabs;
-    // stay muted so it gets dropped instead of resuming a second later.
-    this.muted = true;
-    // ...but if that "interruption" was just noise and no question ever
-    // finalises, nothing would clear the mute and the call would go dead for
-    // good. Unmute shortly after, so the worst case is a clipped sentence.
-    clearTimeout(this.unmute);
-    this.unmute = setTimeout(() => {
-      if (!this.closed && !this.busy) this.muted = false;
-    }, 2500);
-    this.unmute.unref?.();
+    this.tonePlaying = false;
+    // Interrupting a thinking tone is not interrupting an answer: there's no
+    // reply in flight to suppress, and muting here would drop the real answer
+    // when it arrives moments later. Just stop the tone and let the turn
+    // deliver normally.
+    if (wasOnlyTone) {
+      this.stopThinkingTone();
+    } else {
+      // Audio for the interrupted reply is still in flight from ElevenLabs;
+      // stay muted so it gets dropped instead of resuming a second later.
+      this.muted = true;
+      // ...but if that "interruption" was just noise and no question ever
+      // finalises, nothing would clear the mute and the call would go dead for
+      // good. Unmute shortly after, so the worst case is a clipped sentence.
+      clearTimeout(this.unmute);
+      this.unmute = setTimeout(() => {
+        if (!this.closed && !this.busy) this.muted = false;
+      }, 2500);
+      this.unmute.unref?.();
+    }
     // tell Twilio to drop whatever it has already buffered, otherwise the
     // caller keeps hearing the old reply for a second after interrupting
     if (this.ws.readyState === WebSocket.OPEN && this.streamSid) {
@@ -1175,6 +1793,7 @@ class Call {
     clearTimeout(this.unmute);
     clearTimeout(this.utterTimer);
     clearTimeout(this.slowTurnTimer);
+    this.stopThinkingTone();
     try {
       this.dg?.close();
     } catch {}
@@ -1197,6 +1816,12 @@ class Call {
     } catch {}
     this.killBrowser();
     this.saveMemory();
+    // Deliberately NOT killing this.backgroundChildren here. The entire point
+    // of backgrounding a turn is that it keeps running after the caller stops
+    // waiting on it — including after they hang up. Each one is bounded by
+    // its own --max-budget-usd and will exit on its own; its close handler
+    // (in runClaude) sees this.closed and writes the result to call memory
+    // instead of trying to speak into a call that's no longer there.
   }
 
   // Owned for the lifetime of this call — tear it down with it. Left running
