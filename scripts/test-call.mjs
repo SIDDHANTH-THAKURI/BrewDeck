@@ -24,6 +24,7 @@ import {
   CHAT_SYSTEM_PROMPT,
   TASK_SYSTEM_PROMPT,
   needsBrowser,
+  buildClaudeArgs,
 } from "../call.js";
 
 let failures = 0;
@@ -407,6 +408,32 @@ eq("complete: a full request", INCOMPLETE_TAIL_RE.test("Can you open Wikipedia?"
 eq("complete: an imperative", INCOMPLETE_TAIL_RE.test("close the browser"), false);
 eq("complete: a question", INCOMPLETE_TAIL_RE.test("what is the weather"), false);
 eq("complete: ends on a noun", INCOMPLETE_TAIL_RE.test("run the tests"), false);
+
+// 8h. Claude invocation flags. --strict-mcp-config used to be passed only when
+// a browser had launched, so on any task turn that didn't need one the
+// account's other MCP servers (Gmail, Drive, Calendar) were loaded AND
+// reachable by a turn running under bypassPermissions — while the comment at
+// the call site claimed they were out of reach. It is also the biggest latency
+// win measured here: ~6.1s -> ~3.3s per turn, because the CLI was connecting
+// to every one of those servers on every turn and using none of them.
+const argsChat = buildClaudeArgs({ isTask: false, model: "haiku", effort: "low", budget: 1, systemPrompt: "x" });
+const argsTask = buildClaudeArgs({ isTask: true, model: "sonnet", effort: "high", budget: 1, systemPrompt: "x" });
+const argsBrowser = buildClaudeArgs({ isTask: true, model: "sonnet", effort: "high", budget: 1, systemPrompt: "x", browserMcpPath: "/tmp/b.json" });
+
+eq("chat turns are strict-mcp", argsChat.includes("--strict-mcp-config"), true);
+eq("task turns are strict-mcp even with no browser", argsTask.includes("--strict-mcp-config"), true);
+eq("browser turns are strict-mcp", argsBrowser.includes("--strict-mcp-config"), true);
+eq("a browser turn points at the browser config",
+  argsBrowser[argsBrowser.indexOf("--mcp-config") + 1], "/tmp/b.json");
+eq("a non-browser turn points at an empty config",
+  /call-no-mcp\.json$/.test(argsTask[argsTask.indexOf("--mcp-config") + 1]), true);
+// the rest of the tier split must survive the extraction
+eq("only task turns bypass permissions", argsTask.includes("bypassPermissions"), true);
+eq("chat turns never bypass permissions", argsChat.includes("bypassPermissions"), false);
+eq("only task turns load the push-blocking hook", argsTask.includes("--settings"), true);
+eq("chat turns disallow every tool", argsChat.includes("--disallowed-tools"), true);
+eq("resume is passed through when present",
+  buildClaudeArgs({ isTask: false, model: "haiku", effort: "low", budget: 1, systemPrompt: "x", resume: "sess-1" }).includes("--resume"), true);
 
 // 9. Model policy — fast by default, sonnet for work, opus only on request
 eq("chat routes to haiku", pickModel("chat", {}), { model: "haiku", effort: "low" });

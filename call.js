@@ -27,6 +27,20 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 // absolute hook path is always correct for whatever machine this runs on,
 // rather than baking a path (with this user's home directory in it) into git.
 const CALL_SETTINGS_PATH = path.join(ROOT, ".brews", "call-hook-settings.json");
+// An MCP config with nothing in it, paired with --strict-mcp-config on every
+// turn that isn't using the browser. Two reasons, and the second is the
+// important one:
+//
+//  - Latency. Measured on this machine, repeatedly: a trivial haiku turn takes
+//    ~6.1s without it and ~3.3s with it. The CLI was connecting to every MCP
+//    server on the account (Gmail, Drive, Calendar and the rest) on EVERY
+//    single turn, ~2.8s of work whose results a call never uses.
+//  - Reach. --strict-mcp-config used to be passed only when a browser had been
+//    launched, so on any task turn that didn't need one — most of them — those
+//    same account servers were loaded AND reachable by a turn running under
+//    bypassPermissions. The comment at the spawn site claimed they were out of
+//    reach; they were not. Passing this always is what makes that true.
+const EMPTY_MCP_PATH = path.join(ROOT, ".brews", "call-no-mcp.json");
 
 // Browser control for the task tier, so "open YouTube and play the third
 // video" can actually happen rather than being refused.
@@ -87,6 +101,7 @@ function writeCallSettings() {
     },
   };
   fs.writeFileSync(CALL_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  fs.writeFileSync(EMPTY_MCP_PATH, JSON.stringify({ mcpServers: {} }));
 }
 
 // Chat turns run here rather than in the repo, so claude isn't sitting in
@@ -958,6 +973,50 @@ export const TASK_SYSTEM_PROMPT = [
   "  so describe what you found in a sentence rather than reading the page out.",
 ].join("\n");
 
+// Pulled out of the spawn path so the security-critical part is testable. The
+// invariant that matters: EVERY call turn passes --strict-mcp-config. That was
+// previously conditional on a browser having launched, which silently left the
+// account's other MCP servers reachable on any task turn that didn't need one
+// — while a comment at the call site asserted the opposite. A rule nothing
+// checks is a rule that quietly stops being true.
+export function buildClaudeArgs({
+  isTask,
+  model,
+  effort,
+  budget,
+  systemPrompt,
+  browserMcpPath = null,
+  resume = null,
+  emptyMcpPath = EMPTY_MCP_PATH,
+  settingsPath = CALL_SETTINGS_PATH,
+}) {
+  const args = [
+    "-p",
+    "--output-format", "stream-json",
+    "--include-partial-messages",
+    "--verbose",
+    "--model", model,
+    "--effort", effort,
+    "--max-budget-usd", String(budget),
+    "--append-system-prompt", systemPrompt,
+    // the browser server and nothing else, or nothing at all
+    "--mcp-config", browserMcpPath || emptyMcpPath,
+    "--strict-mcp-config",
+  ];
+  if (isTask) {
+    args.push("--permission-mode", "bypassPermissions");
+    // hard-blocks git push / gh publish / npm publish even under
+    // bypassPermissions — see call-hooks/block-push.mjs for why voice
+    // specifically doesn't get to trigger those
+    args.push("--settings", settingsPath);
+  } else {
+    // no tools at all on the chat path: nothing to load, nothing to run
+    args.push("--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task");
+  }
+  if (resume) args.push("--resume", resume);
+  return args;
+}
+
 // One live phone call: owns its Deepgram socket, its ElevenLabs socket, and at
 // most one claude child at a time. Everything here dies with the call.
 export class Call {
@@ -1487,33 +1546,15 @@ export class Call {
       }
     }
     if (this.closed) return; // call ended while the browser was coming up
-    const args = [
-      "-p",
-      "--output-format", "stream-json",
-      "--include-partial-messages",
-      "--verbose",
-      "--model", model,
-      "--effort", effort,
-      "--max-budget-usd", String(this.opts.budget),
-      "--append-system-prompt", isTask ? this.taskPrompt() : this.chatPrompt(),
-    ];
-    if (isTask) {
-      args.push("--permission-mode", "bypassPermissions");
-      // hard-blocks git push / gh publish / npm publish even under
-      // bypassPermissions — see call-hooks/block-push.mjs for why voice
-      // specifically doesn't get to trigger those
-      args.push("--settings", CALL_SETTINGS_PATH);
-      // browser control, and *only* browser control when present: strict mode
-      // means the account's Gmail/Drive/Calendar servers stay out of reach of
-      // a call. Omitted entirely when this turn didn't need a browser, or the
-      // launch failed — the turn still runs, just without those tools.
-      if (browserMcpPath) args.push("--mcp-config", browserMcpPath, "--strict-mcp-config");
-    } else {
-      // no tools at all on the chat path: nothing to load, nothing to run
-      args.push("--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task");
-    }
-    const resume = isTask ? this.taskSession : this.chatSession;
-    if (resume) args.push("--resume", resume);
+    const args = buildClaudeArgs({
+      isTask,
+      model,
+      effort,
+      budget: this.opts.budget,
+      systemPrompt: isTask ? this.taskPrompt() : this.chatPrompt(),
+      browserMcpPath,
+      resume: isTask ? this.taskSession : this.chatSession,
+    });
 
     const child = spawn("claude", args, {
       cwd: isTask ? this.opts.cwd : CALL_SCRATCH_DIR,
