@@ -13,6 +13,7 @@ import {
   isBackgroundCommand,
   isShortAffirmation,
   isFollowUp,
+  INCOMPLETE_TAIL_RE,
   parseDevNote,
   buildThinkingTone,
   isSelfEcho,
@@ -358,6 +359,54 @@ eq("inversion: 'help me' with a real object", classifyIntent("can you help me cl
 // idioms that begin with an action verb now that bare imperatives can route
 eq("inversion: 'see you later' is not a screen request", classifyIntent("see you later"), "chat");
 eq("inversion: 'let's see' is a filler", classifyIntent("let's see, I'm not sure"), "chat");
+
+// 8f. Vision questions route on phrasing, not on a noun. A live call's "what
+// can you see on my screen" was transcribed "...on McQueen", removing the only
+// machine word, so a screenshot request reached the tier with no screenshot
+// tool. Speech recognition mangling one noun should not decide the tier.
+eq("screen: garbled noun still routes", classifyIntent("What can you see on McQueen?"), "task");
+eq("screen: plain phrasing", classifyIntent("what can you see on my screen"), "task");
+eq("screen: can you see my screen", classifyIntent("can you see my screen?"), "task");
+eq("screen: what is on my desktop", classifyIntent("what is on my desktop"), "task");
+// the comprehension idioms must stay conversation
+eq("screen: 'see my point' is not vision", classifyIntent("do you see my point"), "chat");
+eq("screen: 'see what you mean' is not vision", classifyIntent("I see what you mean"), "chat");
+
+// 8g. Vocabulary and phrasings caught live while driving a desktop by voice.
+eq("routing: leading 'you' before an imperative", classifyIntent("You click on bravo."), "task");
+eq("routing: courtesy preface then a request",
+  classifyIntent("Thanks so much. Can you pump up the volume to 50%?"), "task");
+eq("routing: courtesy preface then a question stays chat",
+  classifyIntent("That was helpful. Can you tell me about mortgages?"), "chat");
+eq("routing: toggles and options", classifyIntent("And untoggle the two options in fifty one."), "task");
+eq("routing: drawing", classifyIntent("draw a circle in paint"), "task");
+eq("routing: drawing is not a hobby chat", classifyIntent("I like to draw in my spare time"), "chat");
+eq("routing: painting a room is not a task", classifyIntent("I need to paint my room"), "chat");
+eq("routing: switching careers is not a machine switch", classifyIntent("I need to switch careers"), "chat");
+
+// hangup: "you can disconnect the call" ended a real call verbally and was
+// answered as conversation instead, because only "hang up"/"bye" matched
+eq("hangup: disconnect the call", isHangupCommand("Nah. You can disconnect the call."), true);
+eq("hangup: bare disconnect", isHangupCommand("disconnect"), true);
+eq("hangup: drop the call", isHangupCommand("drop the call"), true);
+// ...but disconnecting other things is not a hangup
+eq("not hangup: disconnect a printer", isHangupCommand("how do I disconnect my printer"), false);
+eq("not hangup: disconnect the router", isHangupCommand("disconnect the wifi router"), false);
+
+// 8e. Unfinished sentences. A live call said "Can you build a web page and",
+// paused to think past the 3s threshold, and the half-request was sent — the
+// reply could only be "sounds like you got cut off there". Silence alone is a
+// bad end-of-turn signal; the words have to look finished too. Raising the
+// threshold for everyone would slow every turn to suit the rare long pause.
+eq("incomplete: trailing conjunction", INCOMPLETE_TAIL_RE.test("Can you build a web page and"), true);
+eq("incomplete: trailing article", INCOMPLETE_TAIL_RE.test("open the"), true);
+eq("incomplete: trailing infinitive", INCOMPLETE_TAIL_RE.test("I want you to"), true);
+eq("incomplete: trailing copula", INCOMPLETE_TAIL_RE.test("can you check if it is"), true);
+// ...complete sentences must not be delayed
+eq("complete: a full request", INCOMPLETE_TAIL_RE.test("Can you open Wikipedia?"), false);
+eq("complete: an imperative", INCOMPLETE_TAIL_RE.test("close the browser"), false);
+eq("complete: a question", INCOMPLETE_TAIL_RE.test("what is the weather"), false);
+eq("complete: ends on a noun", INCOMPLETE_TAIL_RE.test("run the tests"), false);
 
 // 9. Model policy — fast by default, sonnet for work, opus only on request
 eq("chat routes to haiku", pickModel("chat", {}), { model: "haiku", effort: "low" });

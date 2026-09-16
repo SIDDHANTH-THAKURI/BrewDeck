@@ -8,6 +8,21 @@ param(
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
+# Must come before anything reads screen metrics. PowerShell is DPI-unaware by
+# default, which makes these two disagree on a scaled display: VirtualScreen
+# reports LOGICAL pixels (e.g. 1536x960 at 125%) while CopyFromScreen copies
+# PHYSICAL ones, so the capture is the top-left crop of the real screen rather
+# than the whole thing -- anything on the right or bottom is simply missing,
+# and coordinates read off the image do not match where the cursor goes.
+if (-not ([System.Management.Automation.PSTypeName]'BrewdeckDpi').Type) {
+  Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class BrewdeckDpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }
+'@
+}
+[BrewdeckDpi]::SetProcessDPIAware() | Out-Null
+
 $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)

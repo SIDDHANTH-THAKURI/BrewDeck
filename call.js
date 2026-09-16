@@ -232,6 +232,12 @@ const TONE_QUIET_MS = 2500;
 // utterance_end_ms is the lever that decides a turn is over; endpointing only
 // segments the text along the way, so it stays lower.
 const UTTERANCE_END_MS = 3000;
+// Words a sentence cannot end on. Used to hold a flush open a little longer
+// when the caller is plainly mid-thought — see flushUtterance.
+export const INCOMPLETE_TAIL_RE =
+  /\b(?:and|or|but|so|because|with|to|for|from|into|onto|that|which|who|when|while|if|like|about|of|in|on|at|then|also|plus|a|an|the|my|your|our|their|its|is|are|was|were|can|could|would|should|will|it'?s|i'?m|there'?s)\s*[,]?$/i;
+const UTTERANCE_GRACE_MS = 2500;
+const MAX_UTTER_EXTENDS = 2; // at most 5s of extra patience, then it goes anyway
 
 // Nova-3 keyterm prompting. Phone audio is 8kHz and narrowband, which is where
 // proper nouns fall apart: a live call asking to "open wikipedia.com" was
@@ -240,6 +246,9 @@ const UTTERANCE_END_MS = 3000;
 // names, and the "forge" wake word, whose whole job is to be recognised.
 const DG_KEYTERMS = [
   "forge", "brewdeck", "claude",
+  // "what can you see on my screen" came back as "...on McQueen" on a live
+  // call, which stripped the only machine word out of a screen question
+  "screen", "my screen", "the screen", "desktop", "browser", "window",
   "wikipedia", "youtube", "google", "gmail", "github", "spotify", "chatgpt",
   "reddit", "amazon", "netflix", "whatsapp", "outlook", "notepad", "explorer",
   "chrome", "edge", "firefox", "taskbar", "screenshot", "desktop",
@@ -350,7 +359,10 @@ export function parseVoiceCommand(text) {
 // mid-sentence in a longer request doesn't silently end the call. A
 // *question* about hanging up ("how do I close this call?") is deliberately
 // not treated as a command — it should get answered, not silently obeyed.
-const HANGUP_PHRASE_RE = /\b(hang up|hangup|end (the |this )?call|end the phone call)\b/;
+// "you can disconnect the call" was said on a live call to end it, matched
+// nothing here, and was answered as conversation instead of hanging up.
+const HANGUP_PHRASE_RE =
+  /\b(hang up|hangup|end (the |this )?call|end the phone call|disconnect (the |this )?(call|line)|drop the call|cut the call|that'?s all for now)\b|^disconnect\.?$/;
 const BYE_WORD_RE = /\b(bye|goodbye)\b/;
 export function isHangupCommand(text) {
   const t = String(text || "").toLowerCase().trim();
@@ -537,6 +549,8 @@ const TASK_VERB_STEMS = [
   // code" and it routed to the tier that cannot touch a window
   "maximize", "minimize", "resize", "focus", "unfocus", "hide", "dismiss",
   "bring", "drag", "snap", "zoom",
+  // drawing, after a call asked for a smiley face in Paint
+  "draw", "paint", "sketch", "erase", "fill", "colour", "color",
 ];
 
 // "make"/"see" end in a vowel and "grab"/"run" double their final consonant,
@@ -594,7 +608,7 @@ const IMPLICIT_NEED_RE =
 // "see you later" and "take care" start with an action verb and mean nothing
 // of the sort — they only became a risk once bare imperatives could route.
 const NON_MACHINE_RE =
-  /\b(?:video games?|board games?|page of|phone screen|screen time|see you (?:later|soon|tomorrow)|take care|make sense|makes sense|take your time)\b/;
+  /\b(?:video games?|board games?|page of|phone screen|screen time|see you (?:later|soon|tomorrow)|take care|make sense|makes sense|take your time|see my point|see your point|see what (?:i|you) mean|see the point)\b/;
 
 // A few verbs mean machine work and nothing else, so they don't need an object
 // to prove it — "go ahead and commit that" names no object at all, and the
@@ -627,7 +641,7 @@ function spans(re, t) {
 // to the machine ("what's going on in my laptop") — not in the list at all
 // before, so "view what's open on my computer" had no object word to match.
 const TASK_OBJECT_RE =
-  /\b(file|files|folder|folders|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|errors|exception|test|tests|commit|branch|diff|server|app|apps|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|tabs|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen|laptop|computer|pc|machine|node|npm|python|git|build|process|port|database|spreadsheet|report|resume|document|documents|doc|docs|pdf|download|downloads|photo|photos|screenshot|folder name|mouse|cursor|pointer|keyboard|dialog|popup|prompt|icon|taskbar|start menu|desktop icon|checkbox|dropdown|menu|wikipedia|google|gmail|github|reddit|amazon|netflix|whatsapp|outlook|facebook|instagram|twitter|linkedin|discord|slack|excel|powerpoint|teams|zoom|calculator|settings|calendar|maps)\b/;
+  /\b(file|files|folder|folders|directory|repo|repository|code|codebase|script|function|class|variable|bug|error|errors|exception|test|tests|commit|branch|diff|server|app|apps|application|program|project|package|dependency|brewdeck|desktop|readme|log|logs|browser|tab|tabs|window|terminal|website|url|link|youtube|spotify|chrome|edge|firefox|notepad|explorer|video|button|page|result|results|screen|laptop|computer|pc|machine|node|npm|python|git|build|process|port|database|spreadsheet|report|resume|document|documents|doc|docs|pdf|download|downloads|photo|photos|screenshot|folder name|mouse|cursor|pointer|keyboard|dialog|popup|prompt|icon|taskbar|start menu|desktop icon|checkbox|dropdown|menu|toggle|toggles|switches|option|options|slider|sliders|radio|field|fields|form|canvas|circle|square|rectangle|shape|line|wikipedia|google|gmail|github|reddit|amazon|netflix|whatsapp|outlook|facebook|instagram|twitter|linkedin|discord|slack|excel|powerpoint|teams|zoom|calculator|settings|calendar|maps)\b/;
 
 // A bare domain is a machine object even though it's in no word list: a live
 // call asked "can you open wikipedia.com?" and it routed to the tool-less tier
@@ -665,17 +679,33 @@ const KNOWLEDGE_VERB_RE =
 const KNOWLEDGE_TOPIC_RE =
   /\b(?:weather|news|time|date|score|recipe|restaurant|flight|hotel|price|stock|joke|fact|meaning|definition|translation|history|population|capital|holiday|movie|film|song|book|guitar|cricket|football|advice|secret|maths?|language|french|spanish|german|hindi|opinion|idea|dream|religion|politics|mortgage|mortgages|budget)\b/;
 const QUESTION_START_RE = /^(?:what|why|how|who|when|where|which|whose)\b/;
+// Vision questions, matched on phrasing rather than on any noun surviving the
+// transcription. The "see my point"/"see what I mean" idioms are excluded in
+// NON_MACHINE_RE, which is checked first.
+const SCREEN_QUESTION_RE =
+  /\b(?:what (?:can|do) you see|can you see (?:my|the|this|that|what)|what'?s (?:on|open on) (?:my|the)|look at (?:my|the) (?:screen|desktop))\b/;
 // Imperatives that have no ordinary conversational use, so they can route on
 // their own with no object at all ("scroll down", "maximize", "refresh").
 // Deliberately narrow: a general "starts with any verb" rule sent "show me
 // you're taking this seriously" and "see you later" to the task tier.
+// The leading filler list matters as much as the verbs. A live call said "You
+// click on bravo" — a plain instruction — and it routed to chat because the
+// sentence opened on "you" rather than the verb. People preface commands with
+// all of these on the phone.
 const IMPERATIVE_ACTION_RE =
-  /^(?:please\s+|just\s+|now\s+|go\s+)?(?:scroll|maximi[sz]e|minimi[sz]e|refresh|reload|paste|undo|redo|zoom|restart|reboot|uninstall|screenshot|click|double.?click|close|reopen|mute|unmute)\b/;
+  /^(?:(?:ok(?:ay)?|now|then|and|so|just|please|go|you|could|can|would|let'?s|i want you to|i need you to)\b[\s,.]+)*(?:scroll|maximi[sz]e|minimi[sz]e|refresh|reload|paste|undo|redo|zoom|restart|reboot|uninstall|screenshot|click|double.?click|close|reopen|mute|unmute|press|tap|select|type|open|drag|hit|toggle|untoggle|tick|untick|check|uncheck|enable|disable|turn|switch|set|move|pick|choose|draw|paint|sketch|erase|fill)\b/;
 
 export function classifyIntent(text) {
   const t = String(text || "").toLowerCase().trim();
   if (!t) return "chat";
   if (NON_MACHINE_RE.test(t)) return "chat";
+  // Asking what can be seen is always an instruction to go and look, and it
+  // must survive speech recognition mangling the only machine noun in the
+  // sentence — a live call's "what can you see on my screen" arrived as "what
+  // can you see on McQueen", which left no object to route on and sent a
+  // screenshot request to the tier with no screenshot tool. The phrasing
+  // itself is the signal here, not the noun.
+  if (SCREEN_QUESTION_RE.test(t)) return "task";
   if (STANDALONE_VERB_RE.test(t)) return "task";
 
   const objects = [...spans(TASK_OBJECT_RE, t), ...spans(DOMAIN_RE, t)];
@@ -698,9 +728,15 @@ export function classifyIntent(text) {
   if (!hasObject && (KNOWLEDGE_VERB_RE.test(t) || KNOWLEDGE_TOPIC_RE.test(t) || QUESTION_START_RE.test(t))) {
     return "chat";
   }
-  // The inversion: anything shaped like a request is work.
-  if (REQUEST_FORM_RE.test(t)) return "task";
-  if (IMPERATIVE_ACTION_RE.test(t)) return "task";
+  // The inversion: anything shaped like a request is work. Tested per sentence
+  // rather than against the whole utterance, because both patterns anchor at
+  // the start and people lead with a courtesy: "Thanks so much. Can you pump
+  // up the volume?" routed to chat purely because it opened on "Thanks".
+  const sentences = t.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  for (const s of [t, ...sentences]) {
+    if (REQUEST_FORM_RE.test(s)) return "task";
+    if (IMPERATIVE_ACTION_RE.test(s)) return "task";
+  }
   return "chat";
 }
 
@@ -1134,17 +1170,38 @@ export class Call {
   }
 
   // Join the accumulated final segments into the one thing the caller said.
-  flushUtterance() {
+  // A sentence that stops on "and", "to", "the" is not a sentence yet, whatever
+  // the silence says. A live call asked "Can you build a web page and" — the
+  // caller paused to think, the pause cleared the threshold, and the half
+  // request went to claude, which could only reply "sounds like you got cut off
+  // there". Raising the threshold for everyone would slow every turn down to
+  // suit the rare long pause; waiting only when the words themselves are
+  // unfinished costs nothing on a complete sentence.
+  flushUtterance(force = false) {
     clearTimeout(this.utterTimer);
     this.utterTimer = null;
     const parts = this.utterQ || [];
-    this.utterQ = [];
     if (!parts.length) return;
+    const joined = parts.join(" ").replace(/\s+/g, " ").trim();
+
+    if (!force && INCOMPLETE_TAIL_RE.test(joined) && (this.utterExtends || 0) < MAX_UTTER_EXTENDS) {
+      this.utterExtends = (this.utterExtends || 0) + 1;
+      // left in utterQ on purpose: more speech appends to it, and the Results
+      // handler resets this timer, so a caller who simply carried on is not
+      // interrupted by the grace period expiring underneath them
+      this.log(`utterance ends mid-thought ("${joined.slice(-24)}") — waiting ${UTTERANCE_GRACE_MS}ms`);
+      this.utterTimer = setTimeout(() => this.flushUtterance(true), UTTERANCE_GRACE_MS);
+      this.utterTimer.unref?.();
+      return;
+    }
+
+    this.utterQ = [];
+    this.utterExtends = 0;
     if (this.tHeardFirst) {
       this.log(`speech: ${Date.now() - this.tHeardFirst}ms from first partial to end of utterance`);
       this.tHeardFirst = null;
     }
-    this.onUtterance(parts.join(" ").replace(/\s+/g, " ").trim());
+    this.onUtterance(joined);
   }
 
   onUtterance(text) {

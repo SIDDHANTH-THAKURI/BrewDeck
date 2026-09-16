@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CONTROL GYM — cursor accuracy range</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#272c37; --ink:#e7ecf3; --dim:#8b95a7;
+    --ok:#22c55e; --no:#ef4444; --hot:#d4a06a; --blue:#3b82f6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "Segoe UI",system-ui,sans-serif;overflow:hidden}
+  .wrap{display:flex;height:100vh}
+  .left{flex:1;overflow-y:auto;padding:14px 16px 60px}
+  .right{width:360px;flex:none;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column}
+  h1{font-size:17px;margin:0 0 4px;letter-spacing:.5px}
+  h1 span{color:var(--hot)}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:14px}
+  section{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:#12151b}
+  section > h2{font-size:12px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);margin:0 0 10px}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  button{background:#232936;color:var(--ink);border:1px solid #333c4d;border-radius:8px;
+         padding:9px 15px;font-size:13px;cursor:pointer;font-family:inherit}
+  button:hover{background:#2c3444;border-color:#46536b}
+  button:active{transform:translateY(1px)}
+  button.lit{background:var(--ok);border-color:var(--ok);color:#06210f;font-weight:600}
+  label{font-size:13px;display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+  input[type=range]{width:210px}
+  input[type=text],input[type=number],textarea,select{
+    background:#1b2029;color:var(--ink);border:1px solid #333c4d;border-radius:7px;padding:8px 10px;font-family:inherit;font-size:13px}
+  textarea{width:280px;height:56px;resize:none}
+  select{min-width:160px}
+  .sw{width:56px;height:30px;border-radius:999px;background:#333c4d;position:relative;cursor:pointer;transition:background .15s}
+  .sw::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#e7ecf3;transition:left .15s}
+  .sw.on{background:var(--ok)} .sw.on::after{left:29px}
+  #dialWrap{display:flex;align-items:center;gap:16px}
+  #dial{width:110px;height:110px;border-radius:50%;background:conic-gradient(var(--hot) 0deg,#2a3140 0deg);
+        border:2px solid #3b4557;position:relative;cursor:grab;flex:none}
+  #dial::after{content:"";position:absolute;inset:14px;border-radius:50%;background:#171c25}
+  #dialNeedle{position:absolute;left:50%;top:50%;width:3px;height:42px;background:var(--hot);
+        transform-origin:50% 100%;transform:translate(-50%,-100%) rotate(0deg);z-index:2;border-radius:2px}
+  #dialVal{font-size:26px;font-variant-numeric:tabular-nums;color:var(--hot)}
+  #scrollBox{height:120px;overflow-y:scroll;border:1px solid #333c4d;border-radius:8px;background:#1b2029;padding:8px}
+  #scrollBox div{padding:5px 8px;border-bottom:1px solid #262c38}
+  #dropZone{width:190px;height:78px;border:2px dashed #46536b;border-radius:10px;display:flex;
+        align-items:center;justify-content:center;color:var(--dim);font-size:12px;text-align:center}
+  #dropZone.over{border-color:var(--hot);color:var(--hot)}
+  #dragMe{width:64px;height:64px;border-radius:10px;background:var(--blue);cursor:grab;
+        display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#fff}
+  #ctxTarget{width:180px;height:60px;border:1px solid #46536b;border-radius:8px;display:flex;
+        align-items:center;justify-content:center;color:var(--dim);font-size:12px;background:#1b2029}
+  #dblTarget{width:180px;height:60px;border:1px solid #46536b;border-radius:8px;display:flex;
+        align-items:center;justify-content:center;color:var(--dim);font-size:12px;background:#1b2029}
+  #range{position:relative;height:250px;background:
+      repeating-linear-gradient(0deg,#141920 0 24px,#171d26 24px 48px),
+      repeating-linear-gradient(90deg,#141920 0 24px,#171d26 24px 48px);
+      border:1px solid #333c4d;border-radius:8px;overflow:hidden}
+  .tgt{position:absolute;width:30px;height:30px;border-radius:50%;background:#2a3140;
+      border:2px solid var(--no);display:flex;align-items:center;justify-content:center;
+      font-size:12px;font-weight:700;color:var(--no)}
+  .tgt.hit{background:var(--ok);border-color:var(--ok);color:#06210f}
+  .tgt .dot{position:absolute;width:4px;height:4px;border-radius:50%;background:#fff;pointer-events:none}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:8px}
+  .tab{padding:7px 14px;border-radius:7px 7px 0 0;background:#1b2029;cursor:pointer;font-size:13px;border:1px solid transparent;border-bottom:none}
+  .tab.act{background:#2c3444;color:var(--hot);border-color:#46536b}
+  .panel{display:none;color:var(--dim);font-size:13px;padding:4px} .panel.act{display:block}
+  /* right panel */
+  .scorebox{padding:14px 16px;border-bottom:1px solid var(--line)}
+  #score{font-size:46px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+  #score small{font-size:19px;color:var(--dim);font-weight:400}
+  #pct{font-size:13px;color:var(--dim);margin-top:2px}
+  #tasks{flex:1;overflow-y:auto;padding:8px 10px;font-size:12px}
+  .task{display:flex;gap:8px;padding:4px 6px;border-radius:5px;align-items:flex-start}
+  .task .mk{width:15px;flex:none;text-align:center;font-weight:700;color:var(--no)}
+  .task.done{color:var(--dim)} .task.done .mk{color:var(--ok)}
+  .task.done .tx{text-decoration:line-through}
+  #log{height:150px;overflow-y:auto;border-top:1px solid var(--line);padding:8px 10px;
+      font:11px/1.5 ui-monospace,Consolas,monospace;color:var(--dim);background:#10131a}
+  .untrusted{color:var(--no);font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="left">
+  <h1>CONTROL <span>GYM</span></h1>
+  <div class="sub">Every control below scores only on <b>isTrusted</b> events — real OS-level input.
+     Anything synthesised by script is logged in red and does not count.</div>
+
+  <section>
+    <h2>1 · Buttons</h2>
+    <div class="row">
+      <button data-t="btn-alpha">ALPHA</button>
+      <button data-t="btn-bravo">BRAVO</button>
+      <button data-t="btn-charlie">CHARLIE</button>
+      <button data-t="btn-delta">DELTA</button>
+      <button data-t="btn-echo">ECHO</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>2 · Radios &amp; checkboxes</h2>
+    <div class="row">
+      <label><input type="radio" name="grind" value="fine" data-t="radio-fine"> Fine</label>
+      <label><input type="radio" name="grind" value="medium" data-t="radio-medium"> Medium</label>
+      <label><input type="radio" name="grind" value="coarse" data-t="radio-coarse"> Coarse</label>
+      <span style="width:20px"></span>
+      <label><input type="checkbox" data-t="chk-milk"> Milk</label>
+      <label><input type="checkbox" data-t="chk-sugar"> Sugar</label>
+      <label><input type="checkbox" data-t="chk-ice"> Ice</label>
+    </div>
+  </section>
+
+  <section>
+    <h2>3 · Sliders, number, colour, date</h2>
+    <div class="row">
+      <span style="color:var(--dim);font-size:12px">Volume</span>
+      <input type="range" id="vol" min="0" max="100" value="0" data-t="slider-vol">
+      <b id="volV" style="color:var(--hot);width:34px">0</b>
+      <input type="number" id="num" min="0" max="99" value="0" style="width:82px" data-t="spin-num">
+      <input type="color" id="col" value="#3b82f6" style="width:56px;height:36px;padding:2px" data-t="color-pick">
+      <input type="date" id="dt" data-t="date-pick">
+    </div>
+  </section>
+
+  <section>
+    <h2>4 · Dial (drag to turn)</h2>
+    <div id="dialWrap">
+      <div id="dial" data-t="dial"><div id="dialNeedle"></div></div>
+      <div>
+        <div id="dialVal">0°</div>
+        <div style="color:var(--dim);font-size:12px">press, drag around the rim, release</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5 · Toggles, select, text</h2>
+    <div class="row">
+      <div class="sw" id="sw1" data-t="toggle-1"></div>
+      <div class="sw" id="sw2" data-t="toggle-2"></div>
+      <select id="sel" data-t="select-bean">
+        <option value="">— pick a bean —</option>
+        <option value="wisp">WISP · Haiku</option>
+        <option value="crema">CREMA · Sonnet</option>
+        <option value="burr">BURR · Opus</option>
+        <option value="quill">QUILL · Fable</option>
+      </select>
+      <input type="text" id="txt" placeholder="type here" style="width:190px" data-t="text-type">
+      <textarea id="ta" placeholder="and here"data-t="area-type"></textarea>
+    </div>
+  </section>
+
+  <section>
+    <h2>6 · Scroll, right-click, double-click, drag &amp; drop</h2>
+    <div class="row" style="align-items:flex-start">
+      <div style="width:230px">
+        <div id="scrollBox" data-t="scroll-box">
+          <div>row 01</div><div>row 02</div><div>row 03</div><div>row 04</div><div>row 05</div>
+          <div>row 06</div><div>row 07</div><div>row 08</div><div>row 09</div><div>row 10</div>
+          <div>row 11</div><div>row 12</div><div id="deepRow" style="color:var(--hot)">row 13 · BOTTOM</div>
+        </div>
+      </div>
+      <div id="ctxTarget" data-t="ctx-menu">right-click me</div>
+      <div id="dblTarget" data-t="dbl-click">double-click me</div>
+      <div id="dragMe" draggable="true" data-t="drag-src">DRAG</div>
+      <div id="dropZone" data-t="drop-zone">drop here</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>7 · Tabs</h2>
+    <div class="tabs">
+      <div class="tab act" data-tab="0">Roast</div>
+      <div class="tab" data-tab="1" data-t="tab-grind">Grind</div>
+      <div class="tab" data-tab="2" data-t="tab-pour">Pour</div>
+    </div>
+    <div class="panel act">Roast panel — the default one.</div>
+    <div class="panel">Grind panel — reached by clicking the Grind tab.</div>
+    <div class="panel">Pour panel — reached by clicking the Pour tab.</div>
+  </section>
+
+  <section>
+    <h2>8 · Precision range — click targets 1 → 6 in order</h2>
+    <div style="color:var(--dim);font-size:12px;margin-bottom:8px">
+      Positions are randomised on every load. A white dot marks exactly where each click landed.</div>
+    <div id="range"></div>
+    <div class="row" style="margin-top:8px">
+      <button id="reseed">RE-SCATTER TARGETS</button>
+      <span id="miss" style="color:var(--dim);font-size:12px">misses: 0 · best offset: —</span>
+    </div>
+  </section>
+</div>
+
+<div class="right">
+  <div class="scorebox">
+    <div id="score">0<small>/24</small></div>
+    <div id="pct">0% · nothing yet</div>
+  </div>
+  <div id="tasks"></div>
+  <div id="log"></div>
+</div>
+</div>
+
+<script>
+(() => {
+  const TASKS = [
+    ["btn-alpha","Click button ALPHA"],
+    ["btn-charlie","Click button CHARLIE"],
+    ["btn-echo","Click button ECHO"],
+    ["radio-medium","Select radio: Medium"],
+    ["chk-milk","Tick checkbox: Milk"],
+    ["chk-ice","Tick checkbox: Ice"],
+    ["slider-vol","Move Volume slider above 60"],
+    ["spin-num","Set number input to 7 or more"],
+    ["color-pick","Change the colour swatch"],
+    ["date-pick","Set a date"],
+    ["dial","Turn the dial past 120°"],
+    ["toggle-1","Flip toggle 1 on"],
+    ["toggle-2","Flip toggle 2 on"],
+    ["select-bean","Choose BURR · Opus in the select"],
+    ["text-type","Type into the text field"],
+    ["area-type","Type into the textarea"],
+    ["scroll-box","Scroll the list to the bottom"],
+    ["ctx-menu","Right-click the context target"],
+    ["dbl-click","Double-click the double-click target"],
+    ["drop-zone","Drag the blue box into the drop zone"],
+    ["tab-grind","Open the Grind tab"],
+    ["tab-pour","Open the Pour tab"],
+    ["targets-3","Hit precision targets 1–3"],
+    ["targets-6","Hit all six precision targets"],
+  ];
+  const done = new Set();
+  const tasksEl = document.getElementById("tasks");
+  const logEl = document.getElementById("log");
+  const scoreEl = document.getElementById("score");
+  const pctEl = document.getElementById("pct");
+
+  TASKS.forEach(([id, label]) => {
+    const d = document.createElement("div");
+    d.className = "task"; d.id = "task-" + id;
+    d.innerHTML = '<span class="mk">✗</span><span class="tx"></span>';
+    d.querySelector(".tx").textContent = label;
+    tasksEl.appendChild(d);
+  });
+
+  function log(msg, trusted = true) {
+    const line = document.createElement("div");
+    if (!trusted) line.className = "untrusted";
+    const t = new Date().toLocaleTimeString("en-GB", { hour12: false });
+    line.textContent = `${t} ${trusted ? "" : "[SYNTHETIC] "}${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  const SCORED = new Set(TASKS.map(([id]) => id));
+  function pass(id, detail) {
+    // BRAVO and DELTA are decoys — clickable, deliberately not on the task
+    // list. Without this guard they still landed in `done` and pushed the
+    // score past the maximum: a phone call clicked Bravo and read out "score
+    // jumped to twenty five of twenty four", which was an accurate report of
+    // a broken scoreboard.
+    if (!SCORED.has(id)) { log("clicked " + id + " (not a scored task)"); return; }
+    if (done.has(id)) return;
+    done.add(id);
+    const el = document.getElementById("task-" + id);
+    if (el) { el.classList.add("done"); el.querySelector(".mk").textContent = "✓"; }
+    scoreEl.innerHTML = done.size + "<small>/" + TASKS.length + "</small>";
+    const p = Math.round((done.size / TASKS.length) * 100);
+    pctEl.textContent = p + "% · " + (done.size === TASKS.length ? "ALL CLEAR" : done.size + " of " + TASKS.length);
+    log("PASS " + id + (detail ? " — " + detail : ""));
+  }
+  // The gate: a scripted .click() reports isTrusted === false and is rejected.
+  function guard(ev, id, detail) {
+    if (!ev.isTrusted) { log("rejected " + id + " (isTrusted=false)", false); return false; }
+    pass(id, detail); return true;
+  }
+
+  // 1 buttons
+  document.querySelectorAll("button[data-t]").forEach((b) => {
+    b.addEventListener("click", (e) => { if (guard(e, b.dataset.t)) b.classList.add("lit"); });
+  });
+  // 2 radios + checkboxes
+  document.querySelectorAll('input[type=radio],input[type=checkbox]').forEach((i) => {
+    i.addEventListener("change", (e) => guard(e, i.dataset.t, i.checked ? "on" : "off"));
+  });
+  // 3 slider / number / colour / date
+  const vol = document.getElementById("vol"), volV = document.getElementById("volV");
+  vol.addEventListener("input", (e) => {
+    volV.textContent = vol.value;
+    if (+vol.value > 60) guard(e, "slider-vol", vol.value);
+  });
+  document.getElementById("num").addEventListener("input", (e) => {
+    if (+e.target.value >= 7) guard(e, "spin-num", e.target.value);
+  });
+  document.getElementById("col").addEventListener("input", (e) => {
+    if (e.target.value.toLowerCase() !== "#3b82f6") guard(e, "color-pick", e.target.value);
+  });
+  document.getElementById("dt").addEventListener("input", (e) => {
+    if (e.target.value) guard(e, "date-pick", e.target.value);
+  });
+  // 4 dial — genuine press/drag/release
+  const dial = document.getElementById("dial"), needle = document.getElementById("dialNeedle"),
+        dialVal = document.getElementById("dialVal");
+  let dialing = false;
+  function dialAngle(e) {
+    const r = dial.getBoundingClientRect();
+    const a = Math.atan2(e.clientY - (r.top + r.height / 2), e.clientX - (r.left + r.width / 2));
+    let deg = Math.round((a * 180) / Math.PI + 90); if (deg < 0) deg += 360;
+    needle.style.transform = `translate(-50%,-100%) rotate(${deg}deg)`;
+    dial.style.background = `conic-gradient(var(--hot) ${deg}deg,#2a3140 ${deg}deg)`;
+    dialVal.textContent = deg + "°";
+    return deg;
+  }
+  dial.addEventListener("mousedown", (e) => { dialing = true; dialAngle(e); e.preventDefault(); });
+  window.addEventListener("mousemove", (e) => {
+    if (!dialing) return;
+    const deg = dialAngle(e);
+    if (deg > 120 && deg < 300) guard(e, "dial", deg + "°");
+  });
+  window.addEventListener("mouseup", () => { dialing = false; });
+  // 5 toggles / select / text
+  ["sw1","sw2"].forEach((id) => {
+    const el = document.getElementById(id);
+    // .toggle, not .add — these used to be one-way. A phone call was asked to
+    // turn both off, clicked them correctly, saw no change and reported
+    // "something's blocking those clicks". Nothing was: the page simply had no
+    // way to represent off once on, so a correct click looked like a failure.
+    el.addEventListener("click", (e) => { if (guard(e, el.dataset.t)) el.classList.toggle("on"); });
+  });
+  document.getElementById("sel").addEventListener("change", (e) => {
+    if (e.target.value === "burr") guard(e, "select-bean", "burr");
+    else log("select changed to '" + e.target.value + "' — needs burr");
+  });
+  document.getElementById("txt").addEventListener("input", (e) => {
+    if (e.target.value.length >= 3) guard(e, "text-type", JSON.stringify(e.target.value));
+  });
+  document.getElementById("ta").addEventListener("input", (e) => {
+    if (e.target.value.length >= 3) guard(e, "area-type", JSON.stringify(e.target.value));
+  });
+  // 6 scroll / ctx / dbl / dnd
+  const sb = document.getElementById("scrollBox");
+  sb.addEventListener("scroll", () => {
+    if (sb.scrollTop + sb.clientHeight >= sb.scrollHeight - 4) pass("scroll-box", "reached bottom");
+  });
+  const ctx = document.getElementById("ctxTarget");
+  ctx.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (guard(e, "ctx-menu")) { ctx.textContent = "✓ right-clicked"; ctx.style.color = "var(--ok)"; }
+  });
+  const dbl = document.getElementById("dblTarget");
+  dbl.addEventListener("dblclick", (e) => {
+    if (guard(e, "dbl-click")) { dbl.textContent = "✓ double-clicked"; dbl.style.color = "var(--ok)"; }
+  });
+  const dz = document.getElementById("dropZone"), dm = document.getElementById("dragMe");
+  dm.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", "box"); log("dragstart"); });
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("over"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("over"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault(); dz.classList.remove("over");
+    if (guard(e, "drop-zone")) { dz.textContent = "✓ dropped"; dz.style.color = "var(--ok)"; dz.style.borderColor = "var(--ok)"; }
+  });
+  // 7 tabs
+  document.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", (e) => {
+      document.querySelectorAll(".tab").forEach((x) => x.classList.remove("act"));
+      document.querySelectorAll(".panel").forEach((x) => x.classList.remove("act"));
+      tab.classList.add("act");
+      document.querySelectorAll(".panel")[+tab.dataset.tab].classList.add("act");
+      if (tab.dataset.t) guard(e, tab.dataset.t);
+    });
+  });
+  // 8 precision range
+  const range = document.getElementById("range");
+  const missEl = document.getElementById("miss");
+  let next = 1, misses = 0, offsets = [];
+  function scatter() {
+    range.innerHTML = ""; next = 1; misses = 0; offsets = [];
+    const W = range.clientWidth, H = range.clientHeight, placed = [];
+    for (let i = 1; i <= 6; i++) {
+      let x, y, tries = 0;
+      do {
+        x = 20 + Math.random() * (W - 70);
+        y = 20 + Math.random() * (H - 70);
+        tries++;
+      } while (tries < 200 && placed.some((p) => Math.hypot(p.x - x, p.y - y) < 78));
+      placed.push({ x, y });
+      const d = document.createElement("div");
+      d.className = "tgt"; d.textContent = i; d.dataset.n = i;
+      d.style.left = Math.round(x) + "px"; d.style.top = Math.round(y) + "px";
+      range.appendChild(d);
+    }
+    missEl.textContent = "misses: 0 · best offset: —";
+    log("targets re-scattered");
+  }
+  range.addEventListener("mousedown", (e) => {
+    if (!e.isTrusted) { log("rejected range click (isTrusted=false)", false); return; }
+    const rb = range.getBoundingClientRect();
+    const t = e.target.closest(".tgt");
+    // mark exactly where the pointer landed, so the offset is visible
+    const dot = document.createElement("div");
+    dot.style.cssText = `position:absolute;width:5px;height:5px;border-radius:50%;background:#fff;
+      left:${e.clientX - rb.left - 2}px;top:${e.clientY - rb.top - 2}px;pointer-events:none;z-index:5`;
+    range.appendChild(dot);
+    if (t && +t.dataset.n === next) {
+      const tb = t.getBoundingClientRect();
+      const off = Math.round(Math.hypot(e.clientX - (tb.left + tb.width / 2), e.clientY - (tb.top + tb.height / 2)));
+      offsets.push(off);
+      t.classList.add("hit");
+      log(`target ${next} hit — ${off}px from centre`);
+      next++;
+      if (next === 4) pass("targets-3", "first three");
+      if (next === 7) pass("targets-6", "avg offset " + Math.round(offsets.reduce((a, b) => a + b, 0) / offsets.length) + "px");
+      missEl.textContent = `misses: ${misses} · avg offset: ${Math.round(offsets.reduce((a, b) => a + b, 0) / offsets.length)}px`;
+    } else {
+      misses++;
+      log(`MISS — wanted target ${next}` + (t ? `, hit ${t.dataset.n}` : ", hit empty space"));
+      missEl.textContent = `misses: ${misses} · ` + (offsets.length
+        ? `avg offset: ${Math.round(offsets.reduce((a, b) => a + b, 0) / offsets.length)}px` : "best offset: —");
+    }
+  });
+  document.getElementById("reseed").addEventListener("click", scatter);
+  scatter();
+  log("gym ready — " + TASKS.length + " tasks");
+})();
+</script>
+</body>
+</html>
