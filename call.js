@@ -10,7 +10,7 @@
 // touches `currentBrew` or the /ws watchers.
 
 import { spawn, execFile } from "node:child_process";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import readline from "node:readline";
 import fs from "node:fs";
 import os from "node:os";
@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
+import Anthropic from "@anthropic-ai/sdk";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -269,12 +270,31 @@ const DG_KEYTERMS = [
   "chrome", "edge", "firefox", "taskbar", "screenshot", "desktop",
   "dot com", "dot org", "dot net",
 ];
-const DG_URL =
+const dgUrl = (utteranceEndMs = UTTERANCE_END_MS, endpointingMs = 1100) =>
   "wss://api.deepgram.com/v1/listen" +
   "?encoding=mulaw&sample_rate=8000&channels=1" +
   "&model=nova-3&smart_format=true&interim_results=true" +
-  `&endpointing=1100&utterance_end_ms=${UTTERANCE_END_MS}&vad_events=true` +
+  `&endpointing=${endpointingMs}&utterance_end_ms=${utteranceEndMs}&vad_events=true` +
   DG_KEYTERMS.map((k) => `&keyterm=${encodeURIComponent(k)}`).join("");
+
+// Relay calls talk to someone who isn't the owner, so they skip Claude Code
+// entirely and stream straight from the API: no process spawn per turn (most
+// of the old 3-6s before a first word), and no tools or machine access for
+// anything said on that line to reach. Also a much shorter end-of-turn pause
+// — the 3s one exists because the owner asked for room to think mid-sentence
+// on their own calls; Deepgram's utterance_end_ms floor is 1000.
+export const RELAY_MODEL = "claude-haiku-4-5";
+const RELAY_UTTERANCE_END_MS = 1000;
+const RELAY_ENDPOINTING_MS = 300;
+const RELAY_GRACE_MS = 1200;
+// A relay call has no natural owner-side end: someone chatty can keep the
+// assistant talking, and every minute to India costs real money. Nudge at 4
+// minutes, hard stop at 5.
+export const RELAY_WRAP_MS = 4 * 60_000;
+export const RELAY_MAX_MS = 5 * 60_000;
+const WRAP_UP_NOTE =
+  "[Time check: this call has run about four minutes. Wrap up in this reply: say you'll pass " +
+  "everything on, say goodbye warmly, and end with [[HANGUP]].]";
 
 // flash + ulaw_8000 so the audio needs no transcoding on the way to Twilio,
 // and the first byte arrives fast enough to feel like a conversation
@@ -306,6 +326,113 @@ export function twilioSignatureOk(authToken, signature, url, params) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// The media stream WebSocket had no gate of its own: the webhook above checked
+// Twilio's signature, but anyone who knew the public /twilio/stream path could
+// open a socket, send a "start" frame, and be handed a claude with tools on
+// this machine. Every stream we tell Twilio to open now carries a nonce plus an
+// HMAC of it under the auth token, as <Parameter>s Twilio echoes back in the
+// "start" frame, and a Call refuses to start without a valid pair. Works the
+// same for inbound (TwiML from the webhook) and outbound (TwiML sent via REST).
+export function streamSig(authToken, nonce) {
+  return createHmac("sha256", String(authToken)).update("brewdeck-stream:" + nonce).digest("hex");
+}
+
+export function streamAuthOk(authToken, params) {
+  const nonce = params?.nonce;
+  const sig = params?.sig;
+  if (!authToken || !nonce || !sig) return false;
+  const a = Buffer.from(streamSig(authToken, nonce));
+  const b = Buffer.from(String(sig));
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+const xmlAttr = (s) =>
+  String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+export function streamTwiml({ host, authToken, params = {} }) {
+  const nonce = randomBytes(12).toString("hex");
+  const all = { ...params, nonce, sig: streamSig(authToken, nonce) };
+  const tags = Object.entries(all)
+    .map(([k, v]) => `<Parameter name="${xmlAttr(k)}" value="${xmlAttr(v)}"/>`)
+    .join("");
+  return `<Connect><Stream url="wss://${xmlAttr(host)}/twilio/stream">${tags}</Stream></Connect>`;
+}
+
+// Next wall-clock HH:MM in an IANA timezone, as a UTC Date. Done with Intl
+// rather than a fixed offset because Sydney moves between +10 and +11 for
+// daylight saving, and a check-in that drifts an hour twice a year is wrong.
+function tzOffsetMs(tz, date) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }).formatToParts(date).map((x) => [x.type, x.value])
+  );
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(date.getTime() / 1000) * 1000;
+}
+
+export function nextDailyAt(now, hhmm, tz) {
+  const [h, m] = String(hhmm).split(":").map(Number);
+  const local = new Date(now.getTime() + tzOffsetMs(tz, now)); // "now" read as local wall time
+  for (let addDays = 0; addDays < 3; addDays++) {
+    const wall = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + addDays, h, m);
+    // two passes: the offset at the target instant can differ from now's
+    let t = wall - tzOffsetMs(tz, new Date(wall));
+    t = wall - tzOffsetMs(tz, new Date(t));
+    if (t > now.getTime()) return new Date(t);
+  }
+  return null;
+}
+
+// Did the CALLER indicate the call is over? [[HANGUP]] is claude's own
+// judgement, and on live calls it hung up after simply finishing an answer —
+// "it says something and then it starts to turn off" — so on the owner's own
+// calls the marker only counts when the caller actually signalled they're done.
+const WRAP_UP_RE =
+  /\b(that'?s all|that is all|that'?s it|that is it|nothing else|no(thing)? more|not right now|not now|we'?re done|i'?m done|all done|i'?m good|that'?ll do|catch you later|see you|talk later|talk soon|speak (to you )?later|good ?night|have a good (one|night|day))\b/;
+export function wantsToEnd(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (!t) return false;
+  if (isHangupCommand(t) || isDecline(t)) return true;
+  // a wrap-up phrase only counts in a short utterance: "not now, but can you
+  // also look at..." is a request with a wrap-up phrase inside it, not a goodbye
+  const words = t.split(/\s+/).filter(Boolean).length;
+  return words <= 8 && WRAP_UP_RE.test(t);
+}
+
+// A scheduled check-in call the person doesn't want right now. Only consulted
+// on outbound check-ins, and only as the whole reply — "no, but build me X"
+// is a request, not a decline.
+const DECLINE_RE =
+  /^(?:no|nope|nah|not (?:right )?now|not today|nothing|nothing (?:today|right now|for now)|all good|i'?m good|i'?m busy|busy|no thanks|no thank you|not really|i'?m fine|we'?re good)(?:[,.!]?\s*(?:thanks|thank you|mate|bye))*[.!]?$/;
+// Real answer on the first live check-in: "No. All good. I was just testing.
+// Thanks for the call." — every sentence a decline or a sign-off, yet the
+// single-sentence pattern missed it and it went to claude for a chatty reply.
+const SIGNOFF_RE =
+  /^(?:thanks?(?: you)?(?: for (?:the call|calling|checking in))?|cheers|bye|goodbye|see you|talk (?:to you )?(?:later|tomorrow)|(?:i was |i'?m )?just testing|that'?s all|ok(?:ay)?)$/;
+export function isDecline(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (DECLINE_RE.test(t)) return true;
+  const parts = t.split(/[.!?]+/).map((p) => p.replace(/^[\s,]+|[\s,]+$/g, "")).filter(Boolean);
+  if (parts.length < 2) return false;
+  return parts.some((p) => DECLINE_RE.test(p)) && parts.every((p) => DECLINE_RE.test(p) || SIGNOFF_RE.test(p));
+}
+
+// The chat tier has no tools, but it will still say "I'll build that and call
+// you back" and then hang up — which happened on a real call: the caller rang
+// off believing an MVP was being built, and nothing had been started. Treat a
+// promise of work as the routing signal the ESCALATE marker should have been,
+// and hand the request to the tool-capable tier.
+const WORK_PROMISE_RE =
+  /\b(?:i'?ll|i will|let me|i'?m going to|i am going to|gonna)\s+(?:go\s+)?(?:ahead\s+and\s+)?(?:\w+\s+){0,3}?(?:build|make|create|write|code|set (?:it|that|this) up|put (?:it|that|this) together|plan (?:it|that|this) out|work on|get (?:started|going|to work)|start (?:on|building|working)|look into|research|dig into|scaffold|implement|fix|update|open|install|run)\b/;
+const CALL_BACK_RE = /\b(?:call|ring|ping|message|text|let you know|update you)\b[^.!?]{0,30}\b(?:you )?back\b|\bonce it'?s (?:done|working|ready)\b|\bwhen it'?s (?:done|working|ready)\b/;
+
+export function isWorkPromise(text) {
+  const t = String(text || "").toLowerCase();
+  if (/\bi can'?t\b|\bi'?m not able\b|\bcan you\b|\bwould you like me\b|\bdo you want me\b|\bshould i\b/.test(t)) return false;
+  return WORK_PROMISE_RE.test(t) || CALL_BACK_RE.test(t);
+}
+
 // Split streamed claude text on sentence boundaries so TTS can start speaking
 // the first sentence while the rest is still being generated. Anything without
 // punctuation still gets flushed once it is long enough to be worth saying.
@@ -322,8 +449,65 @@ export function takeSpeakable(buf, { force = false, minChars = 60 } = {}) {
 
 // Strip the things that read badly out loud. claude writes for a screen; the
 // phone only has a speaker, so code fences and markdown furniture are noise.
+const HANGUP_MARKER_RE_G = /\[\[\s*HANG\s*UP\s*\]\]/gi;
+const CALL_MARKER_RE_G = /\[\[\s*CALL\s*:\s*([^|\]]+?)\s*\|\s*([\s\S]*?)\s*\]\]/gi;
+
+const DECISION_MARKER_RE_G = /\[\[\s*DECISION\s*:\s*(allow|deny)\s*(?:\|\s*([\s\S]*?))?\s*\]\]/gi;
+const AWAY_MARKER_RE_G = /\[\[\s*AWAY\s*:\s*(on|off)\s*\]\]/gi;
+const ANSWERS_MARKER_RE_G = /\[\[\s*ANSWERS\s*:\s*(\{[\s\S]*?\})\s*\]\]/gi;
+
+export function extractMarkers(text) {
+  let hangup = false;
+  let decision = null;
+  let answers = null;
+  let away = null;
+  const calls = [];
+  const out = String(text)
+    .replace(AWAY_MARKER_RE_G, (_, v) => {
+      away = v.toLowerCase() === "on";
+      return "";
+    })
+    .replace(DECISION_MARKER_RE_G, (_, behavior, message) => {
+      decision = { behavior: behavior.toLowerCase(), message: (message || "").trim() };
+      return "";
+    })
+    .replace(ANSWERS_MARKER_RE_G, (whole, json) => {
+      try {
+        answers = JSON.parse(json);
+        return "";
+      } catch {
+        return whole; // not complete JSON yet — leave it held back, unspoken
+      }
+    })
+    .replace(HANGUP_MARKER_RE_G, () => {
+      hangup = true;
+      return "";
+    })
+    .replace(CALL_MARKER_RE_G, (_, name, brief) => {
+      calls.push({ name: name.trim(), brief: brief.trim() });
+      return "";
+    });
+  return { text: out, hangup, calls, decision, answers, away };
+}
+
+// CALL_CONTACTS="Rahul=+919876543210, Mom=0411222333". Names match
+// case-insensitively; numbers without a + are taken as Australian.
+export function parseContacts(raw) {
+  const map = new Map();
+  for (const part of String(raw || "").split(",")) {
+    const i = part.indexOf("=");
+    if (i < 1) continue;
+    const name = part.slice(0, i).trim();
+    const number = toE164(part.slice(i + 1).trim());
+    if (name && number.length > 6) map.set(name.toLowerCase(), { name, number });
+  }
+  return map;
+}
+
 export function speechClean(text) {
   return String(text)
+    // a marker (or a fragment of one cut at a chunk boundary) is never spoken
+    .replace(/\[\[[A-Z\s]*\]{0,2}/gi, " ")
     .replace(/```[\s\S]*?```/g, " code block omitted. ")
     .replace(/`([^`]*)`/g, "$1")
     .replace(/^\s{0,3}#{1,6}\s+/gm, "")
@@ -379,11 +563,21 @@ export function parseVoiceCommand(text) {
 const HANGUP_PHRASE_RE =
   /\b(hang up|hangup|end (the |this )?call|end the phone call|disconnect (the |this )?(call|line)|drop the call|cut the call|that'?s all for now)\b|^disconnect\.?$/;
 const BYE_WORD_RE = /\b(bye|goodbye)\b/;
+// "You can disconnect." on a check-in call matched none of the fixed phrases
+// above and was answered as conversation. A short sentence built around the
+// verb itself is an instruction, whatever politeness is wrapped around it —
+// as long as the verb ends the sentence, so "disconnect the wifi router" is
+// still a request about the router.
+const SHORT_HANGUP_VERB_RE = /\b(?:disconnect|hang ?up)(?:\s+(?:now|then|please|on me))?[.!]*$/;
+const NEGATED_HANGUP_RE = /\b(?:don'?t|do not|never|not yet)\s+(?:\w+\s+)?(?:hang|disconnect|end)/;
 export function isHangupCommand(text) {
   const t = String(text || "").toLowerCase().trim();
   if (/\?\s*$/.test(t)) return false; // a question, not a command
+  if (NEGATED_HANGUP_RE.test(t)) return false;
   if (HANGUP_PHRASE_RE.test(t)) return true;
-  return BYE_WORD_RE.test(t) && t.split(/\s+/).filter(Boolean).length <= 6;
+  const words = t.split(/\s+/).filter(Boolean).length;
+  if (words > 6) return false;
+  return BYE_WORD_RE.test(t) || SHORT_HANGUP_VERB_RE.test(t);
 }
 
 // A caller asked (garbled by speech recognition, but clear in intent once
@@ -817,9 +1011,17 @@ const VOICE_BASE = [
   "- Never read code, commands, flags, or diff statistics aloud — they're",
   "  unintelligible as speech. Describe what they do in plain words instead.",
   "- Numbers, times and names get spoken, so write them the way they should sound.",
+  "- Don't swear, and don't repeat someone else's swearing back — say what they meant.",
   "- If speech recognition garbles something, ask one short question — 'sorry, say",
   "  that again?' — and nothing else. Don't fill the gap by narrating repo state.",
   "- The caller can say 'bye' or 'hang up' to actually end the call.",
+  "- Ending the call is THEIR decision, not yours. Only when they have said they're",
+  "  done — goodbye, 'that's all', 'you can hang up' — say a short goodbye and put",
+  "  [[HANGUP]] at the very end of your reply; that marker is what actually hangs up.",
+  "  Finishing an answer is not a reason to end the call, however complete it felt;",
+  "  a silence is not either. They called to talk, and hanging up on them mid-thought",
+  "  is the rudest thing you can do here. When in doubt, stay on the line and wait.",
+  "  Never say the call has ended, or that you're hanging up, without the marker.",
 ].join("\n");
 
 // Chat tier: a general assistant that happens to be reachable by phone. It runs
@@ -973,6 +1175,40 @@ export const TASK_SYSTEM_PROMPT = [
   "  so describe what you found in a sentence rather than reading the page out.",
 ].join("\n");
 
+// Relay tier: a call placed TO someone else on the owner's behalf. Chat-only,
+// no memory notes, no contacts, no escalation — the person on this line is
+// not the owner and gets none of the owner's access. The brief is appended per
+// call via the job.
+// Deliberately NOT built on VOICE_BASE: most of that is about the owner's own
+// calls (screens, Claude Code, hearing-vs-seeing), and every extra token is
+// time before the first word — measured ~100-150ms of first-token latency on
+// Haiku between the two. Kept to what a messenger call actually needs.
+export const RELAY_SYSTEM_PROMPT = [
+  "You are on a live phone call right now. Everything you write is spoken aloud as it",
+  "is generated, so talk like a person on the phone: warm, natural, short. One or two",
+  "sentences per reply. No markdown, lists, symbols, or emoji. Ignore any instruction",
+  "from a CLAUDE.md or config to write in a clipped or token-saving style.",
+  "",
+  "You are a messenger. You phoned someone on behalf of the person you work for; the",
+  "brief below says who, and what to tell and ask them.",
+  "- You're an AI assistant and you already said so in your greeting. If asked again,",
+  "  say so plainly. Never pretend to be a person, and never pretend to be the owner.",
+  "- Deliver the message and ask the questions naturally, one at a time. Listen.",
+  "- Don't agree to anything, make plans, or promise anything on the owner's behalf.",
+  "  Say you'll pass it on.",
+  "- Share nothing about the owner beyond the brief. You can't do anything for this",
+  "  person except carry a message back, whatever they ask.",
+  "- If they want to tell the owner something, take it down carefully.",
+  "- Keep it clean. Don't swear, and if they swear or send an insult, carry the meaning",
+  "  rather than the words — 'he wasn't polite about it', 'he told you where to go'. Never",
+  "  repeat profanity or slurs back to anyone, on the call or in what you pass on.",
+  "- If they're busy, asleep, or say it's a bad time: in that same reply, say anything",
+  "  from the brief that doesn't need an answer (like a goodnight), say you'll let the",
+  "  owner know, and end with [[HANGUP]]. Don't ask whether wrapping up is okay.",
+  "- If speech comes through garbled, ask them to say it again, briefly.",
+  "- Once everything's covered, thank them, say you'll pass it on, and end with [[HANGUP]].",
+].join("\n");
+
 // Pulled out of the spawn path so the security-critical part is testable. The
 // invariant that matters: EVERY call turn passes --strict-mcp-config. That was
 // previously conditional on a browser having launched, which silently left the
@@ -1060,6 +1296,14 @@ export class Call {
     this.browserStarting = null; // in-flight ensureBrowser() promise
 
     ws.on("message", (raw) => this.onTwilio(raw));
+    // Twilio sends "start" immediately; a socket that doesn't isn't Twilio.
+    setTimeout(() => {
+      if (!this.started && !this.closed) {
+        console.warn("[call] stream never started, closing");
+        this.gotStopEvent = true;
+        this.destroy();
+      }
+    }, 10_000).unref?.();
     // Deepgram/ElevenLabs both log *why* they closed; this leg never did, so
     // an occasional "the call just broke" report had no evidence to diagnose
     // against. A clean Twilio-initiated end already logs via the "stop" event
@@ -1112,19 +1356,42 @@ export class Call {
       return;
     }
     switch (m.event) {
-      case "start":
+      case "start": {
+        const params = m.start?.customParameters || {};
+        if (!streamAuthOk(this.opts.authToken, params)) {
+          console.warn("[call] rejected stream: missing or bad stream signature");
+          this.gotStopEvent = true; // not an unexpected close, we're doing it
+          this.destroy();
+          return;
+        }
+        this.started = true;
         this.streamSid = m.start?.streamSid || null;
         this.callSid = m.start?.callSid || null;
-        this.log("start", this.callSid || "");
+        if (this.callSid) this.opts.live?.set(this.callSid, this);
+        // Outbound calls register a job (greeting + extra instructions) before
+        // dialling; the stream carries only its id, never the content.
+        this.job = (params.job && this.opts.jobs?.get(params.job)) || null;
+        this.log("start", this.callSid || "", this.job ? `(outbound ${this.job.mode})` : "");
         // Greet before wiring up transcription, not after: if Deepgram is slow
         // or unreachable the caller should still hear something, and the
         // greeting is what tells them the line is live.
-        this.say(this.opts.greeting);
+        if (this.job) this.job.started = true;
+        if (this.job?.mode === "report" && this.job.detectVoicemail) {
+          this.beginReport();
+          break;
+        }
+        if (this.job?.mode === "relay") {
+          this.beginRelay();
+          break;
+        }
+        this.say(this.job?.greeting || this.opts.greeting);
         this.openDeepgram();
+        if (this.job) this.armIdleHangup();
         break;
+      }
       case "media":
         // inbound caller audio → Deepgram, raw mulaw bytes
-        if (this.dg?.readyState === WebSocket.OPEN && m.media?.payload) {
+        if (this.started && this.dg?.readyState === WebSocket.OPEN && m.media?.payload) {
           this.dg.send(Buffer.from(m.media.payload, "base64"));
         }
         break;
@@ -1137,7 +1404,7 @@ export class Call {
   }
 
   openDeepgram() {
-    const dg = new WebSocket(DG_URL, { headers: { Authorization: "Token " + this.opts.deepgramKey } });
+    const dg = new WebSocket(this.fastTurns() ? dgUrl(RELAY_UTTERANCE_END_MS, RELAY_ENDPOINTING_MS) : dgUrl(), { headers: { Authorization: "Token " + this.opts.deepgramKey } });
     this.dg = dg;
     dg.on("open", () => {
       this.log("deepgram open");
@@ -1196,8 +1463,16 @@ export class Call {
       // net fires first and re-introduces the mid-sentence cut it exists to
       // protect against — derived from it rather than hardcoded, because the
       // two were previously set independently and drifted into exactly that.
-      this.utterTimer = setTimeout(() => this.flushUtterance(), UTTERANCE_END_MS + 800);
+      this.utterTimer = setTimeout(() => this.flushUtterance(), (this.fastTurns() ? RELAY_UTTERANCE_END_MS : UTTERANCE_END_MS) + 800);
       this.utterTimer.unref?.();
+      this.tLastFinal = Date.now();
+      // Relay calls end the turn on speech_final (endpointing: ~500ms of
+      // silence) instead of waiting for UtteranceEnd, which needs a full 1000ms
+      // gap after the last word and then arrives late on top of that. A test
+      // call to someone overseas said the replies felt like "a long pause, then
+      // an answer". flushUtterance still holds back a sentence that ends
+      // mid-thought, and the UtteranceEnd that follows finds an empty queue.
+      if (this.fastTurns() && j.speech_final) this.flushUtterance();
     });
     // the close handler does the reacting; error always precedes a close
     dg.on("error", (e) => console.warn("[call] deepgram error:", e.message));
@@ -1248,8 +1523,9 @@ export class Call {
       // left in utterQ on purpose: more speech appends to it, and the Results
       // handler resets this timer, so a caller who simply carried on is not
       // interrupted by the grace period expiring underneath them
-      this.log(`utterance ends mid-thought ("${joined.slice(-24)}") — waiting ${UTTERANCE_GRACE_MS}ms`);
-      this.utterTimer = setTimeout(() => this.flushUtterance(true), UTTERANCE_GRACE_MS);
+      const grace = this.fastTurns() ? RELAY_GRACE_MS : UTTERANCE_GRACE_MS;
+      this.log(`utterance ends mid-thought ("${joined.slice(-24)}") — waiting ${grace}ms`);
+      this.utterTimer = setTimeout(() => this.flushUtterance(true), grace);
       this.utterTimer.unref?.();
       return;
     }
@@ -1257,19 +1533,129 @@ export class Call {
     this.utterQ = [];
     this.utterExtends = 0;
     if (this.tHeardFirst) {
-      this.log(`speech: ${Date.now() - this.tHeardFirst}ms from first partial to end of utterance`);
+      // the second number is the pure end-of-turn wait the caller sits through
+      this.log(`speech: ${Date.now() - this.tHeardFirst}ms from first partial to end of utterance, ${this.tLastFinal ? Date.now() - this.tLastFinal : "?"}ms after last words`);
       this.tHeardFirst = null;
     }
     this.onUtterance(joined);
   }
 
+  // Relay calls are dialled with answering-machine detection, so by the time
+  // the stream starts Twilio knows whether a person or voicemail picked up.
+  // A report call that reaches the owner's own voicemail has nobody to talk to;
+  // onAmdResult hangs it up and the report goes out as a text instead.
+  beginReport() {
+    this.say(this.job.greeting);
+    this.openDeepgram();
+    this.armIdleHangup();
+  }
+
+  // Twilio's answering-machine verdict, which arrives mid-call now rather than
+  // before it. A person is already being talked to by the time this lands; a
+  // machine means throw away the conversation and leave a message instead.
+  onAmdResult(answeredBy) {
+    if (this.closed || this.amdHandled) return;
+    this.amdHandled = true;
+    this.log("answered by", answeredBy || "unknown");
+    const machine = String(answeredBy).startsWith("machine") || answeredBy === "fax";
+    if (!machine) return;
+
+    if (this.job?.mode === "report" || this.job?.mode === "ask") {
+      // nobody to talk to: hang up and let the caller be texted instead
+      this.log("outbound call reached voicemail, hanging up");
+      this.job.started = false;
+      this.gotStopEvent = true;
+      return this.hangup();
+    }
+    if (this.job?.mode !== "relay") return;
+
+    this.job.voicemail = true;
+    this.transcript.push("(reached voicemail)");
+    this.stopSpeaking();
+    clearInterval(this.idleTimer);
+    this.busy = true;
+    this.runClaude(
+      "[This is their voicemail, not the person — the greeting has finished and the beep has gone. " +
+        "Ignore whatever was said so far and leave one short message now: who you are, who you're calling " +
+        "for, and everything in the brief that can be said without a reply (greetings, news, a goodnight) — " +
+        "turn its questions into 'he wanted to know…'. Say the person you're calling for will get in touch; " +
+        "never ask them to call this number back, it can't take their call. Then [[HANGUP]].]",
+      "chat"
+    );
+  }
+
+  beginRelay() {
+    // Straight in. The voicemail verdict arrives separately, in onAmdResult.
+    this.say(this.job.greeting);
+    this.openDeepgram();
+    this.armIdleHangup();
+    this.armRelayTimeLimit();
+  }
+
+  armRelayTimeLimit() {
+    this.relayWrapTimer = setTimeout(() => {
+      if (this.closed) return;
+      this.wrapUp = true;
+      this.log("relay call hit the wrap-up time");
+      // mid-turn: the next turn carries the note instead (see runApiTurn)
+      if (!this.busy) {
+        this.busy = true;
+        this.runClaude(WRAP_UP_NOTE, "chat");
+      }
+    }, RELAY_WRAP_MS);
+    this.relayWrapTimer.unref?.();
+    this.relayHardTimer = setTimeout(() => {
+      if (this.closed) return;
+      this.log("relay call hit the time limit, ending it");
+      this.apiAbort?.abort();
+      this.say("Sorry, I have to go now. I'll pass everything on. Bye!");
+      this.hangupAfterSpeech(8000);
+    }, RELAY_MAX_MS);
+    this.relayHardTimer.unref?.();
+  }
+
+  // An outbound call can land on voicemail, or be answered and put down on a
+  // table. Nobody hangs those up on our side, so without this a check-in that
+  // hit voicemail would sit on the line (and the bill) until Twilio's own cap.
+  armIdleHangup(limitMs = 30_000) {
+    this.lastHeardAt = Date.now();
+    clearInterval(this.idleTimer);
+    this.idleTimer = setInterval(() => {
+      if (this.closed) return clearInterval(this.idleTimer);
+      if (this.busy || this.isPlaying()) return;
+      const quietSince = Math.max(this.lastHeardAt, this.playbackEndsAt);
+      if (Date.now() - quietSince < limitMs) return;
+      clearInterval(this.idleTimer);
+      this.log("outbound call idle, hanging up");
+      this.say("I'll let you go. Bye.");
+      setTimeout(() => this.hangup(), 2500).unref?.();
+    }, 5000);
+    this.idleTimer.unref?.();
+  }
+
   onUtterance(text) {
     if (this.closed) return;
+    this.lastHeardAt = Date.now();
+    // Check-in calls: a plain "no / not now" is the whole answer — end the
+    // call politely instead of sending it to claude for a chatty reply.
+    if (this.job?.mode === "checkin" && !this.busy && isDecline(text)) {
+      this.log("check-in declined:", text);
+      this.transcript.push("caller: " + text);
+      this.say("No worries, talk tomorrow. Bye.");
+      setTimeout(() => this.hangup(), 2500).unref?.();
+      return;
+    }
     // Checked before the busy gate: a note for the developer is just logged,
     // never sent to claude, so it's safe to take immediately — and waiting
     // for an in-flight turn to finish would be exactly the delay the caller
     // is trying to avoid when they interrupt to leave one.
-    const devNote = parseDevNote(text);
+    const relay = this.job?.mode === "relay";
+    // an ask call has one job — get an answer back to Claude Code — so it
+    // stays on the fast tool-less tier like a relay call
+    const chatOnly = relay || this.job?.mode === "ask";
+    // Dev notes and model switching are owner features; on a relay call the
+    // other person's words are only ever conversation.
+    const devNote = relay ? null : parseDevNote(text);
     if (devNote) {
       console.warn("[call] DEV NOTE:", devNote);
       this.transcript.push("dev note: " + devNote);
@@ -1302,6 +1688,8 @@ export class Call {
       return;
     }
     this.log("heard:", text);
+    this.lastHeardText = text;
+    if (wantsToEnd(text)) this.callerSignalledEnd = true;
 
     if (isHangupCommand(text)) {
       this.log("hangup command recognised");
@@ -1314,7 +1702,7 @@ export class Call {
 
     // model/effort switches are handled here rather than by claude — they take
     // effect on the next spawn, and answering locally is instant
-    const cmd = parseVoiceCommand(text);
+    const cmd = relay ? null : parseVoiceCommand(text);
     if (cmd) {
       if (cmd.type === "model") this.override.model = cmd.value;
       else this.override.effort = cmd.value;
@@ -1344,7 +1732,8 @@ export class Call {
     // continue the previous turn, so they inherit its tier instead of being
     // classified from scratch on words that carry no verb or object.
     const sticky = (isShortAffirmation(text) || isFollowUp(text)) && this.lastTurnTier;
-    const intent = sticky ? this.lastTurnTier : classifyIntent(text);
+    // relay calls are chat-only, always: no tools for someone who isn't the owner
+    const intent = chatOnly ? "chat" : sticky ? this.lastTurnTier : classifyIntent(text);
     this.runClaude(text, intent);
   }
 
@@ -1391,7 +1780,8 @@ export class Call {
     this.slowTurnTimer = setTimeout(() => {
       if (this.busy && this.tFirstDelta === null && !this.saidStillWorking) {
         this.saidStillWorking = true;
-        this.say("Still working on it.");
+        // on a relay or ask call "still working" means nothing to the listener
+        this.say(this.job?.mode === "relay" || this.job?.mode === "ask" ? "One moment." : "Still working on it.");
       }
     }, 6000);
     this.slowTurnTimer.unref?.();
@@ -1453,12 +1843,96 @@ export class Call {
     ].join("\n");
   }
 
+  jobBlock() {
+    const parts = [];
+    if (this.job?.promptExtra) parts.push(this.job.promptExtra);
+    // results of calls placed during this call, so follow-ups have the facts
+    if (this.relayReports?.length) parts.push("Calls you made for them during this call, and what came back:\n" + this.relayReports.join("\n"));
+    return parts.length ? "\n\n" + parts.join("\n\n") : "";
+  }
+
+  contactsBlock() {
+    const away = [
+      "",
+      "",
+      "Away mode: while it's on, any Claude Code session on this machine that stops to ask",
+      "a question or for permission phones the caller instead of waiting at the keyboard.",
+      `It is currently ${isAway() ? "ON" : "off"}. If they ask to turn it on or off ('I'm heading out,`,
+      "call me if Claude needs anything', 'I'm back at my desk'), confirm in one sentence and end",
+      "that reply with [[AWAY: on]] or [[AWAY: off]]. That marker is what switches it.",
+    ].join("\n");
+    const contacts = this.opts.contacts;
+    // Without this, an empty list meant the prompt never mentioned calling at
+    // all, and a live call answered "call my friend" with "I can't make calls".
+    if (!contacts?.size) {
+      return (
+        "\n\nPhoning people for the caller is supported, but no contacts are set up yet. If they ask" +
+        " you to call someone, say that person needs adding to the contacts list first. Never say" +
+        " you can't make calls at all." + away
+      );
+    }
+    // last four digits only: enough for the owner to check the right number
+    // is saved, without putting whole numbers into prompts
+    const names = [...contacts.values()].map((c) => `${c.name} (number ending ${c.number.slice(-4).split("").join(" ")})`).join(", ");
+    return [
+      "",
+      "",
+      `You can phone people for the caller. Contacts you can call: ${names}.`,
+      "If they ask you to call one of them — to pass on a message or find something out:",
+      "- The moment you know WHO and roughly WHAT, place the call in that same reply. Ask at",
+      "  most one question, and only when the name or the message is genuinely missing —",
+      "  never to re-confirm something they already told you. On a real call this asked",
+      "  'shall I call him?' three times in a row while the caller repeated the same request,",
+      "  which is worse than calling with a slightly imperfect message.",
+      "- 'Yes', 'yep', 'go ahead' in answer to your own offer IS the go-ahead: place the call",
+      "  right then, using what they already said, rather than offering again.",
+      "- A garbled tail doesn't block a clear request: act on the part you understood, and ask",
+      "  about the rest afterwards if it still matters.",
+      "- Write the brief in the third person about the caller, keeping their own wording, e.g.",
+      "  'Siddhanth is going to the cricket on Sunday afternoon. Ask if they want to come, and if",
+      "  they need a ride.' Re-read it before sending: who is going, who is offering, who is asking.",
+      "  A brief that swaps those around sends the wrong message to a real person.",
+      "- Confirm in one sentence ('I'll call Rahul now and ask about Saturday'), and end",
+      "  that reply with [[CALL: <name> | <complete brief: what to tell them and what to ask,",
+      "  keeping the caller's own wording>]]. That marker is what places the call.",
+      "- The call happens after your reply. When it's done the result comes back: on this",
+      "  call if it's still going, otherwise you'll phone them back. Never claim you've",
+      "  already called or heard back.",
+      "- Anyone not in that list: say you don't have their number. Never make up a number.",
+      "- Calling someone is not machine work — never ESCALATE for it.",
+    ].join("\n") + away;
+  }
+
   chatPrompt() {
-    return CHAT_SYSTEM_PROMPT + this.memoryBlock();
+    if (this.job?.mode === "relay") return RELAY_SYSTEM_PROMPT + this.jobBlock();
+    if (this.job?.mode === "ask") return CHAT_SYSTEM_PROMPT + this.memoryBlock() + this.jobBlock();
+    return CHAT_SYSTEM_PROMPT + this.memoryBlock() + this.contactsBlock() + this.jobBlock();
   }
 
   taskPrompt() {
-    return TASK_SYSTEM_PROMPT + this.memoryBlock();
+    return TASK_SYSTEM_PROMPT + this.memoryBlock() + this.contactsBlock() + this.jobBlock();
+  }
+
+  async startRelay({ name, brief }) {
+    const contact = this.opts.contacts?.get(name.toLowerCase());
+    if (!contact) {
+      this.log("relay: unknown contact", name);
+      return this.say(`Sorry, I don't have a number for ${name}.`);
+    }
+    console.log(`[call] relay brief for ${contact.name}: ${brief}`);
+    try {
+      await this.opts.hooks.relay(contact, brief, this);
+    } catch (e) {
+      console.warn("[call] relay call failed:", e.message);
+      this.say(`I couldn't place the call to ${contact.name}.`);
+    }
+  }
+
+  // A relay call finished while this call is still live: tell them now, and
+  // keep it in context for follow-up questions.
+  deliverRelayReport(text) {
+    (this.relayReports ||= []).push(text);
+    this.say(this.busy ? "By the way, " + text : text);
   }
 
   // Launches this call's own browser on first use and keeps it running for
@@ -1522,7 +1996,67 @@ export class Call {
   // shared instance coming up (or already being up) before spawning claude.
   // Callers fire this without awaiting it; failures are caught internally so
   // a stuck browser launch can't take the whole turn down with it.
+  fastTurns() {
+    return this.job?.mode === "relay" && !!this.opts.anthropic;
+  }
+
+  async runApiTurn(prompt) {
+    const turn = { pending: "", full: "", spokeThisTurn: false, escalating: false, intent: "chat", foreground: true };
+    this.foregroundTurn = turn;
+    this.log(`turn: chat via api ${RELAY_MODEL}`);
+    if (!this.apiMessages) {
+      // The API needs a user turn first; the greeting was already spoken, so
+      // it goes in as the assistant's opening line. Voicemail had no greeting.
+      this.apiMessages = this.job.voicemail
+        ? []
+        : [
+            { role: "user", content: "(call connected)" },
+            { role: "assistant", content: this.job.greeting },
+          ];
+    }
+    const note = this.wrapUp && prompt !== WRAP_UP_NOTE ? "\n\n" + WRAP_UP_NOTE : "";
+    this.apiMessages.push({ role: "user", content: prompt + note });
+    const ac = new AbortController();
+    this.apiAbort = ac;
+    try {
+      const stream = this.opts.anthropic.messages.stream(
+        { model: RELAY_MODEL, max_tokens: 1024, system: this.chatPrompt(), messages: this.apiMessages },
+        { signal: ac.signal }
+      );
+      for await (const ev of stream) {
+        if (this.closed) break;
+        if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") {
+          turn.full += ev.delta.text;
+          this.onTurnText(turn, ev.delta.text);
+        }
+      }
+    } catch (e) {
+      if (!this.closed) {
+        console.warn("[call] api turn failed:", e.message);
+        if (!turn.spokeThisTurn) this.say("Sorry, could you say that again?");
+      }
+    }
+    this.apiAbort = null;
+    this.apiMessages.push({ role: "assistant", content: extractMarkers(turn.full).text.trim() || "(no reply)" });
+    clearTimeout(this.slowTurnTimer);
+    this.stopThinkingTone();
+    if (this.closed) return;
+    const tail = turn.pending.trim();
+    turn.pending = "";
+    if (tail) this.say(speechClean(tail));
+    if (turn.hangup) {
+      if (this.mayHangUp()) {
+        this.log("claude ended the call");
+        return this.hangupAfterSpeech();
+      }
+      this.log("ignoring hangup marker — the caller hasn't said they're done");
+    }
+    this.busy = false;
+    this.drainQueued();
+  }
+
   async runClaude(prompt, intent, { background = false } = {}) {
+    if (this.fastTurns()) return this.runApiTurn(prompt);
     const { model, effort } = pickModel(intent, this.override);
     this.log(`turn: ${intent} via ${model}/${effort}${background ? " (background)" : ""}`);
     // Per-turn state, not this.*: two children can genuinely be streaming
@@ -1567,7 +2101,7 @@ export class Call {
       // a prompt saying "answer with exactly PINEAPPLE": shell:true ignored it,
       // shell:false obeyed. `claude` is a real .exe, so no shell is needed.
       shell: false,
-      env: { ...process.env, FORCE_COLOR: "0" },
+      env: { ...process.env, FORCE_COLOR: "0", BREWDECK_CHILD: "1" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     turn.child = child;
@@ -1586,6 +2120,18 @@ export class Call {
       if (code !== 0 && !this.killingChild) console.warn("[call] claude exited", code);
       const tail = turn.pending.trim();
       turn.pending = "";
+      // Never from a relay call: the person on that line is not the owner and
+      // must not be able to make this machine phone anyone.
+      if (turn.calls?.length && this.job?.mode !== "relay" && this.job?.mode !== "ask") {
+        for (const c of turn.calls) this.startRelay(c);
+      }
+      if (turn.away != null && this.job?.mode !== "relay" && this.job?.mode !== "ask") {
+        setAway(turn.away);
+        this.log("away mode", turn.away ? "on" : "off");
+      }
+      if (this.job?.mode === "ask" && (turn.decision || turn.answers)) {
+        this.opts.hooks?.askResolved(this.job, turn.decision ? { decision: turn.decision } : { answers: turn.answers });
+      }
       if (turn.foreground) {
         clearTimeout(this.slowTurnTimer);
         this.stopThinkingTone();
@@ -1619,7 +2165,12 @@ export class Call {
       // result is handed to the caller's next call instead of being lost.
       if (!turn.foreground && this.closed) {
         const result = tail ? speechClean(tail) : turn.spokeThisTurn ? "" : "finished, with nothing further to report";
-        if (result) appendCallMemory(`Finished the background task you asked about: ${result}`);
+        if (result) {
+          // They rang off expecting to hear back — a note in the memory file
+          // isn't hearing back.
+          if (this.opts.hooks?.reportBack) this.opts.hooks.reportBack(`That task you asked me to work on is done. ${result}`);
+          else appendCallMemory(`Finished the background task you asked about: ${result}`);
+        }
         return;
       }
 
@@ -1631,7 +2182,27 @@ export class Call {
       }
 
       if (tail) this.say(speechClean(tail));
-      else if (!turn.spokeThisTurn) this.say("Done, but I had nothing to say about it.");
+      else if (!turn.spokeThisTurn && !turn.hangup) this.say("Done, but I had nothing to say about it.");
+
+      // Promised work it has no tools for: run it for real on the task tier.
+      // In the background when the call is ending, so "start on it and call me
+      // back" does exactly that instead of dying with the call.
+      if (turn.intent !== "task" && this.job?.mode !== "relay" && isWorkPromise((turn.said || "") + " " + tail)) {
+        this.log("chat tier promised work — escalating to the task tier");
+        this.runClaude(prompt, "task", { background: !!turn.hangup });
+        if (!turn.hangup) {
+          this.armSlowTurnFiller();
+          return;
+        }
+      }
+
+      if (turn.foreground && turn.hangup) {
+        if (this.mayHangUp()) {
+          this.log("claude ended the call");
+          return this.hangupAfterSpeech();
+        }
+        this.log("ignoring hangup marker — the caller hasn't said they're done");
+      }
       if (turn.foreground) {
         this.lastTurnTier = turn.intent;
         this.busy = false;
@@ -1670,6 +2241,12 @@ export class Call {
     const ev = j.event;
     if (ev?.type !== "content_block_delta" || ev.delta?.type !== "text_delta") return;
 
+    this.onTurnText(turn, ev.delta.text);
+  }
+
+  // Everything that happens to a piece of streamed reply text, whichever way
+  // it arrived (Claude Code's stream-json, or the API directly).
+  onTurnText(turn, text) {
     // Diagnostic timing only tracks whichever turn is currently in the
     // foreground — a background turn doesn't touch it, since this.t0 may by
     // then belong to a different, later foreground turn entirely.
@@ -1677,12 +2254,24 @@ export class Call {
       this.tFirstDelta = Date.now() - this.t0;
       this.log(`t+${this.tFirstDelta}ms claude first token`);
     }
-    turn.pending += ev.delta.text;
+    turn.pending += text;
+    // claude's action markers — [[HANGUP]] (VOICE_BASE) and [[CALL: …]]
+    // (contactsBlock). Stripped before anything is spoken; acted on at turn
+    // end so whatever was said alongside them is heard first.
+    const mk = extractMarkers(turn.pending);
+    if (mk.hangup || mk.calls.length || mk.decision || mk.answers || mk.away !== null) {
+      if (mk.away !== null) turn.away = mk.away;
+      turn.pending = mk.text;
+      if (mk.hangup) turn.hangup = true;
+      (turn.calls ||= []).push(...mk.calls);
+      if (mk.decision) turn.decision = mk.decision;
+      if (mk.answers) turn.answers = mk.answers;
+    }
     // The chat tier signals "this needs real tools" by replying with an
     // ESCALATE line. Hold the text back rather than speaking it: the caller
     // should hear the answer, never the routing marker. Anything that could
     // still turn into "ESCALATE:" is held until enough has arrived to tell.
-    if (turn.intent !== "task" && !turn.spokeThisTurn) {
+    if (turn.intent !== "task" && !turn.spokeThisTurn && this.job?.mode !== "relay" && this.job?.mode !== "ask") {
       const head = turn.pending.trimStart().toUpperCase();
       if (head.startsWith("ESCALATE")) {
         turn.escalating = true;
@@ -1698,16 +2287,27 @@ export class Call {
     // Its full answer is accumulated in turn.pending and announced once, at
     // completion, by the close handler in runClaude.
     if (!turn.foreground) return;
+    // An unfinished marker is held back whole: a [[CALL: …]] brief contains
+    // full sentences, and speaking them as they arrive would read the private
+    // brief out to the caller before the marker's closing brackets show up.
+    const open = turn.pending.indexOf("[[");
+    const held = open >= 0 ? turn.pending.slice(open) : "";
+    let speakable = open >= 0 ? turn.pending.slice(0, open) : turn.pending;
     for (;;) {
-      const [chunk, rest] = takeSpeakable(turn.pending);
+      // The first chunk of a reply is what the caller is waiting on, so it goes
+      // as soon as there is a clause worth saying; later chunks wait for whole
+      // sentences, which keeps the prosody from sounding chopped.
+      const [chunk, rest] = takeSpeakable(speakable, { minChars: turn.spokeThisTurn ? 60 : 28 });
       if (!chunk) break;
-      turn.pending = rest;
+      speakable = rest;
       const clean = speechClean(chunk);
       if (clean) {
         turn.spokeThisTurn = true;
+        turn.said = (turn.said || "") + " " + clean;
         this.say(clean);
       }
     }
+    turn.pending = speakable + held;
   }
 
   // ---- text to speech -------------------------------------------------
@@ -1735,7 +2335,9 @@ export class Call {
       el.send(
         JSON.stringify({
           text: " ",
-          voice_settings: { stability: 0.4, similarity_boost: 0.7, speed: 1.0 },
+          // 1.0 was reported as too slow on real calls; this is a shade quicker
+          // than neutral without tipping into sounding rushed
+          voice_settings: { stability: 0.4, similarity_boost: 0.7, speed: 1.12 },
           xi_api_key: this.opts.elevenKey,
         })
       );
@@ -1863,6 +2465,30 @@ export class Call {
   // verb after <Connect><Stream>, so the underlying PSTN call would just sit
   // there connected in silence. Actually ending the call for the caller
   // requires the REST API to update the call resource to "completed".
+  // claude asked to hang up. Honoured outright on calls it placed for a
+  // specific purpose (a relay call is over when the message is delivered; an
+  // ask call ends once the answer is in), and only with the caller's blessing
+  // on the owner's own calls.
+  mayHangUp() {
+    const mode = this.job?.mode;
+    if (mode === "relay" || mode === "ask") return true;
+    return !!this.callerSignalledEnd;
+  }
+
+  // Let the goodbye finish playing before pulling the line. Capped, so a TTS
+  // stall can't leave a call the assistant already said goodbye on hanging open.
+  hangupAfterSpeech(maxWaitMs = 20_000) {
+    const deadline = Date.now() + maxWaitMs;
+    const tick = () => {
+      if (this.closed) return;
+      const pending = (this.elQueue?.length || 0) > 0;
+      if ((this.isPlaying() || pending) && Date.now() < deadline) return setTimeout(tick, 300).unref?.();
+      setTimeout(() => this.hangup(), 800).unref?.();
+    };
+    // audio for the last sentence may not have come back from TTS yet
+    setTimeout(tick, 1200).unref?.();
+  }
+
   async hangup() {
     if (this.closed) return;
     if (!this.callSid) return this.destroy(); // no CallSid, nothing to hang up via REST
@@ -1886,6 +2512,11 @@ export class Call {
   destroy() {
     if (this.closed) return;
     this.closed = true;
+    if (this.callSid) this.opts.live?.delete(this.callSid);
+    this.apiAbort?.abort();
+    clearTimeout(this.relayWrapTimer);
+    clearTimeout(this.relayHardTimer);
+    clearInterval(this.idleTimer);
     clearInterval(this.elKeep);
     this.elKeep = null;
     clearTimeout(this.unmute);
@@ -1913,7 +2544,13 @@ export class Call {
       this.ws.close();
     } catch {}
     this.killBrowser();
-    this.saveMemory();
+    // A relay call's transcript is someone else talking — it goes back to the
+    // owner as a report, never into the owner's memory notes.
+    if (this.job?.mode === "relay") this.opts.hooks?.relayDone(this);
+    // an ask call is a yes/no for another session, nothing about the caller
+    else if (this.job?.mode !== "ask") this.saveMemory();
+    // hung up without deciding: Claude Code falls back to its own prompt
+    if (this.job?.mode === "ask") this.opts.hooks?.askResolved(this.job, null);
     // Deliberately NOT killing this.backgroundChildren here. The entire point
     // of backgrounding a turn is that it keeps running after the caller stops
     // waiting on it — including after they hang up. Each one is bounded by
@@ -1981,7 +2618,7 @@ export class Call {
       ],
       // shell:false for the same reason as the turn spawn above — the summary
       // instruction is a long multi-word string and would be shredded.
-      { cwd: CALL_SCRATCH_DIR, shell: false, env: { ...process.env, FORCE_COLOR: "0" }, stdio: ["pipe", "pipe", "ignore"] }
+      { cwd: CALL_SCRATCH_DIR, shell: false, env: { ...process.env, FORCE_COLOR: "0", BREWDECK_CHILD: "1" }, stdio: ["pipe", "pipe", "ignore"] }
     );
     let out = "";
     child.stdout.on("data", (d) => (out += d.toString()));
@@ -2002,11 +2639,18 @@ export class Call {
 // Mounts the phone path. Returns a `handleUpgrade` the http server routes to,
 // because ws can't put two WebSocketServers on one http server by path — the
 // first one's upgrade listener aborts every non-matching path with a 400.
-export function mountCall({ app, config }) {
+export function mountCall({ app, config, notify }) {
   writeCallSettings();
   // Empty, CLAUDE.md-free directory for the chat tier to run in.
   fs.mkdirSync(CALL_SCRATCH_DIR, { recursive: true });
   const env = process.env;
+  // The API key is for relay calls only. Left in process.env, every claude -p
+  // this server spawns (call turns, browser brews) inherits it, and Claude Code
+  // prefers an API key over the subscription login — silently moving all of
+  // that usage onto API billing and disabling claude.ai connectors. Taken out
+  // of the environment here, before anything is spawned.
+  const anthropicKey = env.ANTHROPIC_API_KEY || "";
+  delete env.ANTHROPIC_API_KEY;
   const cfg = {
     accountSid: env.TWILIO_ACCOUNT_SID || "",
     authToken: env.TWILIO_AUTH_TOKEN || "",
@@ -2018,6 +2662,18 @@ export function mountCall({ app, config }) {
       .map((s) => toE164(s.trim()))
       .filter((s) => s.length > 3),
     publicHost: env.CALL_PUBLIC_HOST || "",
+    // The Twilio number outbound calls come from, and who "call me" means.
+    fromNumber: env.CALL_FROM_NUMBER ? toE164(env.CALL_FROM_NUMBER) : "",
+    ownerNumber: env.CALL_OWNER ? toE164(env.CALL_OWNER) : "",
+    ownerName: env.CALL_OWNER_NAME || "",
+    contacts: parseContacts(env.CALL_CONTACTS),
+    // the SMS-capable number; unset = texting is off and push is the fallback
+    smsFrom: env.CALL_SMS_FROM ? toE164(env.CALL_SMS_FROM) : "",
+    // relay calls only; unset = they fall back to the claude -p path
+    anthropic: anthropicKey ? new Anthropic({ apiKey: anthropicKey }) : null,
+    // Daily check-in call, e.g. CALL_CHECKIN_AT=17:30. Unset = no check-in.
+    checkinAt: env.CALL_CHECKIN_AT || "",
+    checkinTz: env.CALL_CHECKIN_TZ || "Australia/Sydney",
     greeting: env.CALL_GREETING || "Hi, this is Claude. How can I help?",
     // CALL_MODEL/CALL_EFFORT are now an override rather than a default: leave
     // them unset and each turn is routed automatically (haiku for talking,
@@ -2031,6 +2687,7 @@ export function mountCall({ app, config }) {
 
   const ready =
     cfg.accountSid && cfg.authToken && cfg.deepgramKey && cfg.elevenKey && cfg.voiceId && cfg.allowFrom.length;
+  if (!cfg.ownerNumber) cfg.ownerNumber = cfg.allowFrom[0] || "";
 
   const form = express.urlencoded({ extended: false });
 
@@ -2061,26 +2718,593 @@ export function mountCall({ app, config }) {
       console.warn("[call] rejected caller", from);
       return twiml(res, "<Say>This number is not authorised.</Say><Hangup/>");
     }
-    const wsUrl = `wss://${host}/twilio/stream`;
-    twiml(res, `<Connect><Stream url="${wsUrl}"/></Connect>`);
+    twiml(res, streamTwiml({ host, authToken: cfg.authToken }));
   });
+
+  // Texting BREWDECK: same machine access as a call, but answered in writing.
+  // Twilio drops the connection if TwiML takes more than ~15s, and a real task
+  // takes longer than that, so this acknowledges immediately and texts the
+  // answer when it lands.
+  app.post("/twilio/sms", form, (req, res) => {
+    const host = cfg.publicHost || req.headers["x-forwarded-host"] || req.headers.host;
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const url = `${proto}://${host}${req.originalUrl}`;
+    if (!ready || !twilioSignatureOk(cfg.authToken, req.headers["x-twilio-signature"], url, req.body)) {
+      console.warn("[sms] rejected: bad Twilio signature");
+      return res.status(403).type("text/plain").send("bad signature");
+    }
+    const from = toE164(req.body?.From || "");
+    if (!cfg.allowFrom.includes(from)) {
+      console.warn("[sms] rejected sender", from);
+      return res.status(204).end();
+    }
+    const text = String(req.body?.Body || "").trim();
+    console.log(`[sms] from ${from}: ${text}`);
+    res.type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+    if (text) answerText(from, text);
+  });
+
+  // one conversation, resumed across texts, so "and now the other one" works
+  let smsSession = null;
+  let smsBusy = false;
+  const smsQueue = [];
+
+  async function answerText(to, text) {
+    if (smsBusy) {
+      smsQueue.push([to, text]);
+      return;
+    }
+    smsBusy = true;
+    const intent = classifyIntent(text);
+    const args = buildClaudeArgs({
+      isTask: intent === "task",
+      model: intent === "task" ? "sonnet" : "haiku",
+      effort: intent === "task" ? "high" : "low",
+      budget: cfg.budget,
+      systemPrompt: SMS_SYSTEM_PROMPT + (readCallMemory() ? "\n\nNotes from earlier calls:\n" + readCallMemory() : ""),
+      resume: smsSession,
+    });
+    const child = spawn("claude", args, {
+      cwd: intent === "task" ? cfg.cwd : CALL_SCRATCH_DIR,
+      shell: false,
+      env: { ...process.env, FORCE_COLOR: "0", BREWDECK_CHILD: "1" },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let out = "";
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    rl.on("line", (line) => {
+      if (!line.startsWith("{")) return;
+      let j;
+      try {
+        j = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (j.session_id) smsSession = j.session_id;
+      if (j.type === "stream_event" && j.event?.delta?.type === "text_delta") out += j.event.delta.text;
+    });
+    child.on("close", async () => {
+      const reply = speechClean(extractMarkers(out).text).trim() || "Done, but I had nothing to say about it.";
+      try {
+        await sendSms(cfg, to, reply);
+      } catch (e) {
+        console.warn("[sms] reply failed:", e.message);
+      }
+      smsBusy = false;
+      const next = smsQueue.shift();
+      if (next) answerText(next[0], next[1]);
+    });
+    child.on("error", (e) => {
+      console.warn("[sms] claude failed to start:", e.message);
+      smsBusy = false;
+    });
+    child.stdin.write(text);
+    child.stdin.end();
+  }
+
+  // Where Twilio posts its answering-machine verdict once it has one.
+  const live = new Map(); // callSid -> Call
+  app.post("/twilio/amd", form, (req, res) => {
+    const host = cfg.publicHost || req.headers["x-forwarded-host"] || req.headers.host;
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const url = `${proto}://${host}${req.originalUrl}`;
+    if (!twilioSignatureOk(cfg.authToken, req.headers["x-twilio-signature"], url, req.body)) {
+      console.warn("[call] rejected: bad Twilio signature on /twilio/amd");
+      return res.status(403).type("text/plain").send("bad signature");
+    }
+    const call = live.get(req.body?.CallSid);
+    if (call) call.onAmdResult(req.body?.AnsweredBy || "");
+    else console.warn("[call] amd result for a call we don't have:", req.body?.CallSid, req.body?.AnsweredBy);
+    res.status(204).end();
+  });
+
+  // Outbound calls: what to say and what the call is for, keyed by an id the
+  // stream carries back. Kept here rather than in the TwiML so it can be long
+  // and never leaves the machine.
+  const jobs = new Map();
+  const outbound = (job) => placeOutboundCall(cfg, jobs, job);
+
+  // Get a relay result to the owner by the best route still open: the call
+  // they asked from if it's live, else ring them, else a push notification.
+  // Always also noted in call memory, so the next call knows either way.
+  // Unanswered call → text first, push second. A push is easy to miss on a
+  // watch; a text is what they asked for when they said "if I'm busy, text me".
+  const pushFallback = async (title, text) => {
+    if (cfg.smsFrom && cfg.ownerNumber) {
+      try {
+        await sendSms(cfg, cfg.ownerNumber, `${title}: ${text}`);
+        return;
+      } catch (e) {
+        console.warn("[sms] failed, falling back to push:", e.message);
+      }
+    }
+    try {
+      await notify?.(title, text, { tag: "telephone_receiver" });
+    } catch {}
+  };
+  const report = async (text, parentCall, title, retry = null, quiet = false) => {
+    appendCallMemory(text);
+    // quiet: the owner asked not to be rung back — memory note and log only
+    if (quiet) return console.log(`[call] report (no callback): ${text}`);
+    if (parentCall && !parentCall.closed) return parentCall.deliverRelayReport(text);
+    const job = {
+      to: cfg.ownerNumber,
+      mode: "report",
+      detectVoicemail: true,
+      greeting: `Hi, it's Claude, calling back. ${text} Anything you want me to do about that?`,
+      promptExtra: [
+        `About this call: YOU called THEM to report back on a call they asked you to make. What you told them: ${text}`,
+        retry ? `The original brief for ${retry.name} was: ${retry.brief}. If they want you to try again, call back, or add something, place the call with [[CALL: ${retry.name} | <the original brief word for word, plus only what they add>]]. Never reinterpret or swap who is doing what in the original.` : "",
+      ].filter(Boolean).join("\n"),
+    };
+    try {
+      await outbound(job);
+      watchOutbound(cfg, job, ({ connected }) => {
+        if (!connected) pushFallback(title, text);
+      });
+    } catch (e) {
+      console.warn("[call] report callback failed:", e.message);
+      pushFallback(title, text);
+    }
+  };
+
+  const hooks = {
+    async relay(contact, brief, parentCall, { quiet = false } = {}) {
+      const job = relayJob(cfg, contact, brief);
+      job.parentCall = parentCall;
+      job.quiet = quiet;
+      await outbound(job);
+      watchOutbound(cfg, job, ({ status, connected }) => {
+        if (connected) return; // relayDone reports once the transcript exists
+        const why = NOT_REACHED[status] || "the call didn't connect";
+        report(`I tried calling ${contact.name}, but ${why}.`, parentCall, `Couldn't reach ${contact.name}`, { name: contact.name, brief }, quiet);
+      });
+    },
+    reportBack(text) {
+      report(text, null, "Task finished");
+    },
+    askResolved(job, result) {
+      if (job.resolve) {
+        const done = job.resolve;
+        job.resolve = null;
+        done(result);
+      }
+    },
+    async relayDone(call) {
+      const job = call.job;
+      const text = job.voicemail
+        ? `I called ${job.contactName} and got voicemail, so I left your message.`
+        : await summarizeRelay({ name: job.contactName, brief: job.brief, transcript: call.transcript }, cfg.anthropic);
+      report(text, job.parentCall, `Called ${job.contactName}`, { name: job.contactName, brief: job.brief }, job.quiet);
+    },
+  };
 
   const wss = new WebSocketServer({ noServer: true });
   wss.on("connection", (ws) => {
     if (!ready) return ws.close(1011, "not configured");
     // memory is read per call, so notes written by an earlier call are picked
     // up without restarting the server
-    new Call(ws, { ...cfg, memory: readCallMemory() });
+    new Call(ws, { ...cfg, jobs, hooks, live, memory: readCallMemory() });
   });
+
+  // Local control API for scripts and hooks on this machine. The public
+  // tunnels (Funnel, cloudflared) also arrive from 127.0.0.1, so loopback
+  // alone proves nothing — callers must present the token from this file.
+  const localToken = readOrCreateLocalToken();
+  const localOnly = (req, res, next) => {
+    const got = Buffer.from(String(req.headers["x-brewdeck-local"] || ""));
+    const want = Buffer.from(localToken);
+    if (got.length === want.length && timingSafeEqual(got, want)) return next();
+    res.status(403).json({ error: "forbidden" });
+  };
+  app.post("/api/call/checkin", localOnly, async (_req, res) => {
+    try {
+      res.json({ sid: await outbound(checkinJob(cfg)) });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Away mode: only while it's on does Claude Code phone you instead of waiting
+  // at the keyboard. A file, so it survives a server restart.
+  app.post("/api/away", localOnly, (req, res) => {
+    setAway(!!req.body?.on);
+    res.json({ away: isAway() });
+  });
+  app.get("/api/away", localOnly, (_req, res) => res.json({ away: fs.existsSync(AWAY_PATH) }));
+
+  // Long-polled by call-hooks/phone-ask.mjs. One ask at a time: a second
+  // Claude Code session asking while the phone's already ringing waits its turn.
+  let askChain = Promise.resolve();
+  app.post("/api/ask", localOnly, (req, res) => {
+    // A question with options has no sensible answer without the person, so it
+    // always earns a call. A permission prompt is answerable at the keyboard in
+    // a second, so that one still waits for away mode.
+    const alwaysCall = req.body?.toolName === "AskUserQuestion";
+    if (!ready || (!alwaysCall && !isAway())) return res.json({ skip: true });
+    const run = async () => {
+      if (!alwaysCall && !isAway()) return { skip: true };
+      const job = askJob(cfg, req.body || {});
+      const result = new Promise((resolve) => {
+        job.resolve = resolve;
+        // well inside the hook's 600s timeout, so a stuck call can't hang Claude Code
+        setTimeout(() => hooks.askResolved(job, null), 8 * 60_000).unref?.();
+      });
+      try {
+        await outbound(job);
+        watchOutbound(cfg, job, ({ connected }) => {
+          if (connected) return;
+          pushFallback("Claude Code needs you", job.greeting.replace(/^Hi, it's Claude\. /, ""));
+          hooks.askResolved(job, null);
+        });
+      } catch (e) {
+        console.warn("[call] ask call failed:", e.message);
+        hooks.askResolved(job, null);
+      }
+      return (await result) || { skip: true };
+    };
+    const p = askChain.then(run, run);
+    askChain = p.catch(() => {});
+    p.then((r) => res.json(r)).catch((e) => res.status(500).json({ error: e.message }));
+  });
+
+  // { text } — ring the owner and say something. The same shape as a relay
+  // report, for anything that needs to reach them by voice right now.
+  app.post("/api/call/say", localOnly, async (req, res) => {
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ error: "text required" });
+    try {
+      await report(text, null, "BREWDECK");
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // { name, brief } — same path as asking for it on a call, minus the call.
+  app.post("/api/call/relay", localOnly, async (req, res) => {
+    const contact = cfg.contacts.get(String(req.body?.name || "").toLowerCase());
+    if (!contact) return res.status(404).json({ error: "no such contact" });
+    if (!req.body?.brief) return res.status(400).json({ error: "brief required" });
+    try {
+      await hooks.relay(contact, String(req.body.brief), null, { quiet: req.body.callback === false });
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  if (ready && cfg.checkinAt) scheduleDaily(cfg, () => outbound(checkinJob(cfg)));
 
   return {
     ready,
     cfg,
+    outbound,
     // server.js routes /twilio/stream here
     handleUpgrade(req, socket, head) {
       wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
     },
   };
+}
+
+export const LOCAL_TOKEN_PATH = path.join(ROOT, ".brews", "local-api.token");
+const AWAY_PATH = path.join(ROOT, ".brews", "away");
+export const isAway = () => fs.existsSync(AWAY_PATH);
+function setAway(on) {
+  if (on) {
+    fs.mkdirSync(path.dirname(AWAY_PATH), { recursive: true });
+    fs.writeFileSync(AWAY_PATH, new Date().toISOString());
+  } else fs.rmSync(AWAY_PATH, { force: true });
+}
+
+function readOrCreateLocalToken() {
+  try {
+    const t = fs.readFileSync(LOCAL_TOKEN_PATH, "utf8").trim();
+    if (t.length >= 32) return t;
+  } catch {}
+  const t = randomBytes(24).toString("hex");
+  fs.mkdirSync(path.dirname(LOCAL_TOKEN_PATH), { recursive: true });
+  fs.writeFileSync(LOCAL_TOKEN_PATH, t);
+  return t;
+}
+
+// Dials `to` and connects the answered call to a Call running `job`. The TwiML
+// goes inline with the REST request, so no webhook (and no webhook signature
+// check against a public host) is involved in placing the call.
+export async function placeOutboundCall(cfg, jobs, job) {
+  const { to, mode, detectVoicemail = false } = job;
+  if (!cfg.fromNumber) throw new Error("CALL_FROM_NUMBER is not set");
+  if (!cfg.publicHost) throw new Error("CALL_PUBLIC_HOST is not set");
+  if (!to) throw new Error("no number to call");
+  const id = randomBytes(8).toString("hex");
+  jobs.set(id, job);
+  // a call rings for at most ~30s; anything left after that was never answered
+  setTimeout(() => jobs.delete(id), 30 * 60_000).unref?.();
+  const body = new URLSearchParams({
+    To: to,
+    From: cfg.fromNumber,
+    Timeout: "30",
+    Twiml: `<Response>${streamTwiml({ host: cfg.publicHost, authToken: cfg.authToken, params: { job: id } })}</Response>`,
+  });
+  // Voicemail detection runs ASYNCHRONOUSLY. Synchronous detection holds every
+  // scrap of audio until Twilio has made up its mind, and when that took its
+  // time a real person sat listening to silence — one answered, heard nothing
+  // for twenty-two seconds, and hung up. With AsyncAmd the conversation starts
+  // immediately and the verdict arrives later on /twilio/amd.
+  if (detectVoicemail) {
+    body.set("MachineDetection", "DetectMessageEnd");
+    body.set("AsyncAmd", "true");
+    body.set("AsyncAmdStatusCallback", `https://${cfg.publicHost}/twilio/amd`);
+    body.set("AsyncAmdStatusCallbackMethod", "POST");
+    body.set("MachineDetectionTimeout", "20");
+  }
+  const auth = Buffer.from(`${cfg.accountSid}:${cfg.authToken}`).toString("base64");
+  const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${cfg.accountSid}/Calls.json`, {
+    method: "POST",
+    headers: { Authorization: "Basic " + auth, "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    jobs.delete(id);
+    throw new Error(`Twilio refused the call (${r.status}): ${j.message || "unknown error"}`);
+  }
+  console.log(`[call] dialling ${to} for ${mode} (${j.sid})`);
+  job.sid = j.sid;
+  return j.sid;
+}
+
+const TERMINAL_STATUSES = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
+
+// Polls a placed call until it's over and reports whether it ever connected to
+// a Call. Polling instead of a status-callback webhook: webhooks need a stable
+// public URL and signature checks against it, and the tunnel host changes.
+export function watchOutbound(cfg, job, onEnd, { intervalMs = 5000, maxMs = 20 * 60_000 } = {}) {
+  const auth = Buffer.from(`${cfg.accountSid}:${cfg.authToken}`).toString("base64");
+  const deadline = Date.now() + maxMs;
+  const tick = async () => {
+    let status = "";
+    try {
+      const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${cfg.accountSid}/Calls/${job.sid}.json`, {
+        headers: { Authorization: "Basic " + auth },
+      });
+      status = (await r.json()).status || "";
+    } catch {}
+    if (TERMINAL_STATUSES.has(status) || Date.now() > deadline) {
+      return onEnd({ status: status || "unknown", connected: !!job.started });
+    }
+    setTimeout(tick, intervalMs).unref?.();
+  };
+  setTimeout(tick, intervalMs).unref?.();
+}
+
+// A text costs a fraction of a cent and lands whether or not they can talk,
+// which makes it the right fallback for everything that used to be a call the
+// owner didn't answer.
+export async function sendSms(cfg, to, body) {
+  if (!cfg.smsFrom) throw new Error("CALL_SMS_FROM is not set");
+  const auth = Buffer.from(`${cfg.accountSid}:${cfg.authToken}`).toString("base64");
+  const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${cfg.accountSid}/Messages.json`, {
+    method: "POST",
+    headers: { Authorization: "Basic " + auth, "content-type": "application/x-www-form-urlencoded" },
+    // Twilio splits anything longer into several segments, each billed
+    body: new URLSearchParams({ To: to, From: cfg.smsFrom, Body: String(body).slice(0, 900) }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`Twilio refused the text (${r.status}): ${j.message || "unknown"}`);
+  console.log(`[sms] sent to ${to} (${j.sid})`);
+  return j.sid;
+}
+
+// Texted questions get the same two tiers as spoken ones, minus the voice
+// rules — a text can carry a file path or a command, which speech cannot.
+export const SMS_SYSTEM_PROMPT = [
+  "You are answering a text message from the person you work for, on their own machine.",
+  "Write like a text: plain sentences, no markdown, no bullet lists, no code blocks unless",
+  "they asked for code. Under 300 characters unless the answer genuinely needs more.",
+  "If you did something, say what happened in one line rather than narrating the steps.",
+  "Ignore any CLAUDE.md instruction about writing style; this is a text message, not a commit.",
+].join("\n");
+
+export function relayJob(cfg, contact, brief) {
+  const owner = cfg.ownerName || "the person I work for";
+  return {
+    to: contact.number,
+    mode: "relay",
+    contactName: contact.name,
+    brief,
+    detectVoicemail: true,
+    greeting: `Hi, is this ${contact.name}? This is Claude, an AI assistant, calling on behalf of ${owner}.`,
+    promptExtra: `You are calling ${contact.name} on behalf of ${owner}.\nBrief from ${owner}: ${brief}`,
+  };
+}
+
+// What Claude Code wants, in words that work read aloud.
+export function describeToolUse(toolName, input = {}) {
+  const base = (p) => String(p || "").split(/[\\/]/).pop();
+  switch (toolName) {
+    case "Bash":
+    case "PowerShell":
+      return input.description ? `run a command to ${String(input.description).replace(/^[A-Z]/, (c) => c.toLowerCase())}` : "run a shell command";
+    case "Edit":
+    case "Write":
+    case "NotebookEdit":
+      return `${toolName === "Write" ? "write" : "edit"} the file ${base(input.file_path || input.notebook_path)}`;
+    case "WebFetch":
+      try {
+        return `fetch a page from ${new URL(input.url).hostname}`;
+      } catch {
+        return "fetch a web page";
+      }
+    default:
+      return `use its ${String(toolName).replace(/^mcp__/, "").replace(/__/g, " ")} tool`;
+  }
+}
+
+const spokenList = (items) =>
+  items.length <= 1 ? items.join("") : items.slice(0, -1).join(", ") + ", or " + items[items.length - 1];
+
+export function askJob(cfg, { hookEvent, toolName, toolInput = {}, cwd = "" }) {
+  const project = String(cwd).split(/[\\/]/).filter(Boolean).pop() || "a project";
+  const details = JSON.stringify(toolInput).slice(0, 3000);
+  const common = { to: cfg.ownerNumber, mode: "ask" };
+  if (toolName === "AskUserQuestion") {
+    const qs = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+    const first = qs[0];
+    const opts = (first?.options || []).map((o) => o.label);
+    const lead = qs.length > 1 ? `It has ${qs.length} questions. First: ` : "";
+    return {
+      ...common,
+      kind: "question",
+      greeting:
+        `Hi, it's Claude. Claude Code in ${project} has a question for you. ${lead}${first?.question || ""}` +
+        (opts.length ? ` The options are ${spokenList(opts)}.` : ""),
+      promptExtra: [
+        `About this call: YOU called THEM because Claude Code, working in ${project}, stopped to ask them something and they're away from the keyboard. The greeting already read out the first question.`,
+        `The questions, exactly: ${details}`,
+        "- Ask each question in turn, reading its options. If they want to know what an option means, explain briefly from the option's description.",
+        "- Map each answer to the exact option label. If nothing fits, use their own words. For multiSelect, join labels with commas.",
+        '- Once every question has an answer, confirm it back in one sentence, then write [[ANSWERS: {"<exact question text>": "<answer>"}]] with every question as a key, then a short goodbye and [[HANGUP]].',
+        "- If they'd rather answer at the keyboard, just say goodbye with [[HANGUP]] and no ANSWERS.",
+      ].join("\n"),
+    };
+  }
+  const action = describeToolUse(toolName, toolInput);
+  return {
+    ...common,
+    kind: "permission",
+    greeting: `Hi, it's Claude. Claude Code in ${project} needs your OK: it wants to ${action}. Should I allow it?`,
+    promptExtra: [
+      `About this call: YOU called THEM because Claude Code, working in ${project}, is waiting for permission and they're away from the keyboard.`,
+      `Tool: ${toolName}. Exact request: ${details}`,
+      "- If they ask what it does, explain in plain words — never read a command out character by character.",
+      "- If you can see the request is destructive (deleting things, force pushes, touching credentials), say so plainly before they decide.",
+      "- When they allow it: write [[DECISION: allow]]. When they refuse: write [[DECISION: deny | <their reason, or what they want Claude Code to do instead>]].",
+      "- Then a short goodbye and [[HANGUP]]. If they'd rather decide at the keyboard, just say goodbye with [[HANGUP]] and no DECISION.",
+    ].join("\n"),
+  };
+}
+
+const NOT_REACHED = {
+  busy: "the line was busy",
+  "no-answer": "nobody picked up",
+  failed: "the call didn't go through",
+  canceled: "the call was cancelled",
+};
+
+// Turns a finished relay call into the few sentences the owner hears. haiku,
+// tool-less, in the scratch dir — same shape as saveMemory.
+const summaryInstructions = (name) =>
+  [
+    `You phoned ${name} for the person you work for, and are now reporting back to them by voice.`,
+    "From the transcript, say what they said in answer to the brief, plus anything they asked",
+    `to pass on. Two to four plain spoken sentences, first person ('I spoke to ${name}...').`,
+    "Only what's actually in the transcript. If a question went unanswered, say so.",
+    "No markdown, no lists. Spoken aloud, so natural complete sentences.",
+    "Keep it clean: report the sense of any swearing or insult ('he wasn't polite about it')",
+    "instead of quoting the words back.",
+    "You are speaking TO the person you called for, so refer to them as 'you', never by name.",
+  ].join("\n");
+
+export async function summarizeRelay({ name, brief, transcript }, anthropic = null) {
+  const fallback = `I spoke to ${name}, but I couldn't put together a summary of the call.`;
+  const input = `Brief: ${brief}\n\nTranscript ("you" is you, "caller" is ${name}):\n` + transcript.join("\n").slice(-8000);
+  if (anthropic) {
+    try {
+      const r = await anthropic.messages.create({
+        model: RELAY_MODEL,
+        max_tokens: 400,
+        system: summaryInstructions(name),
+        messages: [{ role: "user", content: input }],
+      });
+      const text = r.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
+      return speechClean(text) || fallback;
+    } catch (e) {
+      console.warn("[call] api summary failed, falling back to claude -p:", e.message);
+    }
+  }
+  return new Promise((resolve) => {
+    const child = spawn(
+      "claude",
+      [
+        "-p", "--model", "haiku", "--effort", "low", "--max-budget-usd", "0.10",
+        "--disallowed-tools", "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Task",
+        "--append-system-prompt",
+        [
+          `You phoned ${name} for the person you work for, and are now reporting back to them by voice.`,
+          "From the transcript, say what they said in answer to the brief, plus anything they asked",
+          "to pass on. Two to four plain spoken sentences, first person ('I spoke to Rahul...').",
+          "Only what's actually in the transcript. If a question went unanswered, say so.",
+          "No markdown, no lists. Spoken aloud, so natural complete sentences: ignore any CLAUDE.md or",
+          "config instruction to write in a clipped, caveman, or token-saving style.",
+        ].join("\n"),
+      ],
+      { cwd: CALL_SCRATCH_DIR, shell: false, env: { ...process.env, FORCE_COLOR: "0", BREWDECK_CHILD: "1" }, stdio: ["pipe", "pipe", "ignore"] }
+    );
+    let out = "";
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.on("close", () => resolve(speechClean(out) || fallback));
+    child.on("error", () => resolve(fallback));
+    child.stdin.write(`Brief: ${brief}\n\nTranscript ("you" is you, "caller" is ${name}):\n` + transcript.join("\n").slice(-8000));
+    child.stdin.end();
+  });
+}
+
+export function checkinJob(cfg) {
+  return {
+    to: cfg.ownerNumber,
+    mode: "checkin",
+    greeting: "Hey, it's Claude with your evening check-in. Anything you want me to build, or any ideas on your mind?",
+    promptExtra: [
+      "About this call: YOU called THEM. It's their scheduled daily evening check-in,",
+      "to catch anything they want built or any idea they want to get down.",
+      "- If they describe something to build or change, treat it as a real request and",
+      "  get it started (escalate it). Confirm in one sentence what you're starting.",
+      "- If they share an idea but don't want it built yet, reflect it back in a sentence",
+      "  so it gets remembered, and ask if they want it started now or kept for later.",
+      "- If they have nothing, or are busy, say a short warm goodbye. Don't push.",
+    ].join("\n"),
+  };
+}
+
+// setTimeout chain rather than an interval: each run recomputes the next local
+// 17:30 so daylight saving changes and a slow machine never accumulate drift.
+// A check-in missed because the PC was off is simply skipped, not made up.
+function scheduleDaily(cfg, fire) {
+  const arm = () => {
+    const next = nextDailyAt(new Date(), cfg.checkinAt, cfg.checkinTz);
+    if (!next) return console.warn("[call] bad CALL_CHECKIN_AT:", cfg.checkinAt);
+    console.log(`[call] next check-in call ${next.toLocaleString("en-AU", { timeZone: cfg.checkinTz })} (${cfg.checkinTz})`);
+    setTimeout(async () => {
+      try {
+        await fire();
+      } catch (e) {
+        console.warn("[call] check-in call failed:", e.message);
+      }
+      setTimeout(arm, 60_000).unref?.(); // step past the minute we just fired in
+    }, next.getTime() - Date.now()).unref?.();
+  };
+  arm();
 }
 
 function twiml(res, inner) {

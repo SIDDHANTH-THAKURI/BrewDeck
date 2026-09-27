@@ -25,6 +25,21 @@ import {
   TASK_SYSTEM_PROMPT,
   needsBrowser,
   buildClaudeArgs,
+  streamSig,
+  streamAuthOk,
+  streamTwiml,
+  nextDailyAt,
+  isDecline,
+  extractMarkers,
+  parseContacts,
+  relayJob,
+  RELAY_SYSTEM_PROMPT,
+  RELAY_WRAP_MS,
+  isWorkPromise,
+  wantsToEnd,
+  RELAY_MAX_MS,
+  askJob,
+  describeToolUse,
 } from "../call.js";
 
 let failures = 0;
@@ -535,6 +550,144 @@ eq("task prompt forbids reading out sensitive on-screen content", /don't read it
 // hearing vs seeing are explicitly kept apart.
 eq("voice base treats seeing and hearing as unrelated", /they are unrelated/i.test(CHAT_SYSTEM_PROMPT), true);
 eq("task prompt: seeing-the-screen is an instruction, not a capability question", /never a yes\/no question to answer without/i.test(TASK_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+
+// Stream auth: the media WebSocket is public, so a Call must refuse any
+// "start" frame that doesn't carry a nonce signed with the auth token.
+{
+  const token = "test-auth-token";
+  eq("stream auth accepts own signature", streamAuthOk(token, { nonce: "abc", sig: streamSig(token, "abc") }), true);
+  eq("stream auth rejects missing params", streamAuthOk(token, {}), false);
+  eq("stream auth rejects wrong token", streamAuthOk(token, { nonce: "abc", sig: streamSig("other", "abc") }), false);
+  eq("stream auth rejects reused sig on other nonce", streamAuthOk(token, { nonce: "xyz", sig: streamSig(token, "abc") }), false);
+  eq("stream auth rejects when unconfigured", streamAuthOk("", { nonce: "abc", sig: streamSig("", "abc") }), false);
+  const xml = streamTwiml({ host: "h.example", authToken: token, params: { job: "j1" } });
+  const got = Object.fromEntries([...xml.matchAll(/name="([^"]+)" value="([^"]+)"/g)].map((m) => [m[1], m[2]]));
+  eq("stream twiml carries a valid nonce/sig pair", streamAuthOk(token, got), true);
+  eq("stream twiml carries job id", got.job, "j1");
+  eq("stream twiml escapes attributes", /&quot;/.test(streamTwiml({ host: 'h"x', authToken: token })), true);
+}
+
+// Daily check-in time: Sydney is +10 in winter, +11 in daylight saving.
+{
+  const at = (iso) => nextDailyAt(new Date(iso), "17:30", "Australia/Sydney").toISOString();
+  eq("check-in later today (AEST)", at("2026-09-17T01:00:00Z"), "2026-09-17T07:30:00.000Z");
+  eq("check-in rolls to tomorrow once passed", at("2026-09-17T07:30:00Z"), "2026-09-18T07:30:00.000Z");
+  eq("check-in in daylight saving (AEDT)", at("2026-12-01T01:00:00Z"), "2026-12-01T06:30:00.000Z");
+  eq("check-in across the DST switch", at("2026-10-03T08:00:00Z"), "2026-10-04T06:30:00.000Z");
+}
+
+// A check-in answered with a plain no ends the call; anything with a request in it doesn't.
+eq("decline: no", isDecline("No."), true);
+eq("decline: not now thanks", isDecline("not now, thanks"), true);
+eq("decline: I'm busy", isDecline("I'm busy"), true);
+eq("decline: nothing today", isDecline("Nothing today."), true);
+eq("not decline: no but build", isDecline("no, but can you build me a timer app"), false);
+eq("not decline: idea", isDecline("I had an idea for the dashboard"), false);
+
+// Fixes from the first live check-in call.
+eq("hangup: you can disconnect", isHangupCommand("You can disconnect."), true);
+eq("hangup: you can hang up now", isHangupCommand("you can hang up now"), true);
+eq("not hangup: don't hang up", isHangupCommand("don't hang up"), false);
+eq("not hangup: wait, don't disconnect", isHangupCommand("wait, don't disconnect"), false);
+eq("decline: real check-in reply", isDecline("No. All good. I was just testing. Thanks for the call."), true);
+eq("not decline: no, then a request", isDecline("No. Actually, build me a timer."), false);
+eq("hangup marker is never spoken", speechClean("Take care. [[HANGUP]]"), "Take care.");
+eq("partial hangup marker is never spoken", speechClean("Bye. [[HANG"), "Bye.");
+eq("voice base tells claude how to actually end the call", /\[\[HANGUP\]\]/.test(CHAT_SYSTEM_PROMPT) && /\[\[HANGUP\]\]/.test(TASK_SYSTEM_PROMPT), true);
+
+// Relay calls: markers, contacts, and what the other person does NOT get.
+{
+  const m = extractMarkers("I'll call Rahul now. [[CALL: Rahul | Tell him dinner is at 8. Ask if he's free Saturday.]]");
+  eq("call marker parsed", m.calls, [{ name: "Rahul", brief: "Tell him dinner is at 8. Ask if he's free Saturday." }]);
+  eq("call marker stripped from speech", m.text.trim(), "I'll call Rahul now.");
+  eq("hangup + call markers together", extractMarkers("Bye. [[HANGUP]]").hangup, true);
+  eq("unfinished call marker not parsed yet", extractMarkers("Okay. [[CALL: Rahul | Tell him").calls.length, 0);
+
+  const c = parseContacts("Rahul=+919876543210, Mom = 0411 222 333, broken, =+61400000000");
+  eq("contacts: overseas number kept", c.get("rahul"), { name: "Rahul", number: "+919876543210" });
+  eq("contacts: local number normalised", c.get("mom").number, "+61411222333");
+  eq("contacts: junk entries skipped", c.size, 2);
+
+  const job = relayJob({ ownerName: "Sid" }, { name: "Rahul", number: "+919876543210" }, "ask about Saturday");
+  eq("relay greeting says it's an AI and for whom", /AI assistant, calling on behalf of Sid/.test(job.greeting), true);
+  eq("relay dials with voicemail detection", job.detectVoicemail, true);
+  eq("relay prompt has no escalation path", /ESCALATE/.test(RELAY_SYSTEM_PROMPT), false);
+  eq("relay prompt forbids pretending to be a person", /never pretend to be a person/i.test(RELAY_SYSTEM_PROMPT.replace(/\n/g, " ")), true);
+}
+
+// Claude Code asking by phone: what gets read out, and what comes back.
+{
+  const d = extractMarkers('Allowing it now. [[DECISION: allow]] Bye. [[HANGUP]]');
+  eq("decision allow parsed", d.decision, { behavior: "allow", message: "" });
+  eq("decision + hangup both parsed", d.hangup, true);
+  eq("deny carries the reason", extractMarkers("[[DECISION: deny | use the test database instead]]").decision, { behavior: "deny", message: "use the test database instead" });
+  const a = extractMarkers('Got it. [[ANSWERS: {"Which framework?": "React"}]]');
+  eq("answers parsed", a.answers, { "Which framework?": "React" });
+  eq("answers stripped from speech", a.text.trim(), "Got it.");
+  eq("away on parsed", extractMarkers("Sure. [[AWAY: on]]").away, true);
+  eq("away off parsed", extractMarkers("[[AWAY: off]]").away, false);
+  eq("no away marker is null", extractMarkers("hello").away, null);
+
+  const cfg = { ownerNumber: "+61400000000" };
+  const q = askJob(cfg, {
+    hookEvent: "PreToolUse",
+    toolName: "AskUserQuestion",
+    toolInput: { questions: [{ question: "Which framework?", header: "Fw", options: [{ label: "React" }, { label: "Vue" }, { label: "Svelte" }] }] },
+    cwd: "C:\\Users\\me\\Desktop\\shop",
+  });
+  eq("question call reads question and options", q.greeting, "Hi, it's Claude. Claude Code in shop has a question for you. Which framework? The options are React, Vue, or Svelte.");
+  eq("question call is an ask job to the owner", [q.mode, q.kind, q.to], ["ask", "question", "+61400000000"]);
+
+  const p = askJob(cfg, { hookEvent: "PermissionRequest", toolName: "Bash", toolInput: { command: "rm -rf dist", description: "Remove the build folder" }, cwd: "/home/me/shop" });
+  eq("permission call says what it wants in words", p.greeting, "Hi, it's Claude. Claude Code in shop needs your OK: it wants to run a command to remove the build folder. Should I allow it?");
+  eq("permission prompt carries the exact command for follow-ups", /rm -rf dist/.test(p.promptExtra), true);
+  eq("edit described by file name only", describeToolUse("Edit", { file_path: "C:\\x\\src\\app.js" }), "edit the file app.js");
+  eq("mcp tool named readably", describeToolUse("mcp__github__create_issue", {}), "use its github create_issue tool");
+}
+
+// Relay calls to other people are capped: nudge to wrap up, then a hard stop.
+eq("relay call hard limit is 5 minutes", RELAY_MAX_MS, 5 * 60_000);
+eq("relay wrap-up nudge comes before the hard stop", RELAY_WRAP_MS < RELAY_MAX_MS, true);
+eq("relay prompt: busy or asleep ends the call without asking", /Don't ask whether wrapping up is okay/.test(RELAY_SYSTEM_PROMPT), true);
+
+// A chat-tier reply that promises work is a routing failure, not an answer:
+// on a real call it said it would build an MVP and call back, then hung up
+// with nothing started.
+eq("promise: build and call back", isWorkPromise("I will plan it out, build an MVP, then call you back once it is working."), true);
+eq("promise: let me get started", isWorkPromise("Perfect. Let me get started."), true);
+eq("promise: going to look into it", isWorkPromise("I am going to look into that for you."), true);
+eq("not a promise: plain goodbye", isWorkPromise("Sounds good, talk tomorrow."), false);
+eq("not a promise: offering", isWorkPromise("Do you want me to build that?"), false);
+eq("not a promise: refusing", isWorkPromise("I cannot build that on this call."), false);
+eq("not a promise: relay passing a message on", isWorkPromise("I will let Siddhanth know you are free."), false);
+
+// Live calls ended themselves after simply finishing an answer. The [[HANGUP]]
+// marker now only counts on the owner's calls once the caller has signalled
+// they are done.
+eq("ends: bye", wantsToEnd("Okay, bye."), true);
+eq("ends: that is all", wantsToEnd("That's all, thanks."), true);
+eq("ends: you can hang up", wantsToEnd("You can hang up now"), true);
+eq("ends: good night", wantsToEnd("Good night"), true);
+eq("not ending: a question", wantsToEnd("what is in my desktop folder?"), false);
+eq("not ending: thanks mid-call", wantsToEnd("thanks, that is helpful"), false);
+eq("not ending: wrap-up phrase inside a request", wantsToEnd("not now, but can you also look at the other folder for me"), false);
+eq("voice base: ending is the caller's decision", /Ending the call is THEIR decision/.test(CHAT_SYSTEM_PROMPT), true);
+
+// A live call asked "shall I call him?" three times while the caller repeated
+// the same request; the contacts block now says to act once who and what are known.
+{
+  const block = CHAT_SYSTEM_PROMPT; // contactsBlock text is appended per call, so check the rule text itself
+  const fs2 = await import("node:fs");
+  const src = fs2.readFileSync(new URL("../call.js", import.meta.url), "utf8");
+  eq("contacts rule: place the call once who and what are known", /place the call in that same reply/.test(src), true);
+  eq("contacts rule: a yes to your own offer is the go-ahead", /IS the go-ahead/.test(src), true);
+  eq("contacts rule: a garbled tail does not block a clear request", /act on the part you understood/.test(src), true);
+}
+
+// A relay call passed an insult back word for word, including in the text that
+// reached the owner. Prompts now carry the meaning, not the language.
+eq("relay prompt keeps it clean", RELAY_SYSTEM_PROMPT.includes("Never") && RELAY_SYSTEM_PROMPT.includes("repeat profanity or slurs"), true);
+eq("voice base: no swearing", CHAT_SYSTEM_PROMPT.includes("repeat someone else's swearing back"), true);
 
 if (failures) {
   console.error(`\n${failures} failing`);

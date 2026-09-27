@@ -10,6 +10,7 @@
     "test:live": "node scripts/test.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
     "@playwright/mcp": "0.0.80",
     "express": "^4.21.2",
     "qrcode-terminal": "^0.12.0",

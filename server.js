@@ -889,7 +889,12 @@ async function notifyBrewEnd(rec) {
   if (result?.cost != null) bits.push("$" + result.cost.toFixed(2));
   if (result?.ms != null) bits.push((result.ms / 1000).toFixed(0) + "s");
   const body = bits.join(" · ");
+  await sendPush(title, body, { urgent: rec.status !== "done", tag: rec.status === "done" ? "coffee" : "warning" });
+}
 
+// Web push to every subscribed device, plus ntfy if configured. Shared by brew
+// notifications and the phone path (call reports nobody picked up for).
+async function sendPush(title, body, { urgent = false, tag = "coffee" } = {}) {
   const subs = loadSubs();
   const gone = [];
   await Promise.all(
@@ -908,7 +913,7 @@ async function notifyBrewEnd(rec) {
     fetch("https://ntfy.sh/" + encodeURIComponent(config.ntfyTopic), {
       method: "POST",
       body,
-      headers: { Title: title, Priority: rec.status === "done" ? "default" : "high", Tags: rec.status === "done" ? "coffee" : "warning" },
+      headers: { Title: title, Priority: urgent ? "high" : "default", Tags: tag },
     }).catch(() => {});
   }
 }
@@ -983,7 +988,7 @@ const server = https.createServer(
 // upgrade with a 400 before the second one is consulted. So both run with
 // noServer and this handler routes upgrades by pathname.
 const wss = new WebSocketServer({ noServer: true });
-const callPath = mountCall({ app, config });
+const callPath = mountCall({ app, config, notify: sendPush });
 
 server.on("upgrade", (req, socket, head) => {
   let pathname;
